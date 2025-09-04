@@ -25,3 +25,22 @@ def fit_similarity_2d(src_xy, dst_xy, eps=1e-8):
     return s.astype(np.float32), R.astype(np.float32), t.astype(np.float32)
 
 
+def normalize_to_bbox(kpts_xy, boxes_xyxy):
+    """
+    kpts_xy: (N,F,17,2) in absolute pixels (full frame)
+    boxes_xyxy: (F,4) for that person (x1,y1,x2,y2) per frame
+    Returns (N,F,17,2) in normalized coords:
+        x' = (x - x1)/w * 2 - 1
+        y' = (y - y1)/w * 2 - (h/w)
+    """
+    b = boxes_xyxy.astype(np.float32)
+    x1, y1, x2, y2 = [b[:, i] for i in range(4)]
+    w = np.maximum(x2 - x1, 1.0)
+    h = np.maximum(y2 - y1, 1.0)
+
+    out = kpts_xy.copy()
+    out[..., 0] = (out[..., 0] - x1[None, :, None]) / w[None, :, None] * 2.0 - 1.0
+    out[..., 1] = (out[..., 1] - y1[None, :, None]) / w[None, :, None] * 2.0 - (h / w)[None, :, None]
+    return out
+
+
