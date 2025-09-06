@@ -29,33 +29,54 @@ def shard_indices(n_items: int, n_shards: int, shard_id: int):
     return start, end
 
 
-def process_one(
-    path: Path,
+# Global worker state (initialized in each process once)
+_DEVICE = None
+_DET_MODEL = None
+_VITPOSE_PROCESSOR = None
+_VITPOSE_MODEL = None
+
+
+def _init_worker(vitpose_repo: str, gpu_id: int):
+    global _DEVICE, _DET_MODEL, _VITPOSE_PROCESSOR, _VITPOSE_MODEL
+    _DEVICE = f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu"
+    _VITPOSE_PROCESSOR = AutoProcessor.from_pretrained(vitpose_repo)
+    _VITPOSE_MODEL = VitPoseForPoseEstimation.from_pretrained(vitpose_repo).to(_DEVICE).eval()
+    _DET_MODEL = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT").to(_DEVICE).eval()
+
+
+def _process_video_task(
+    video_path: str,
+    out_dir: str,
+    data_root: str,
     target_fps: float,
-    out_dir: Path,
-    device: str,
     score_thresh: float,
     debug: bool,
     save_frames: bool,
     model3d: str | None,
     ckpt3d: str | None,
-    det_2d_model,
-    vitpose_processor,
-    vitpose_model,
 ):
+    # Uses globals initialized in _init_worker
+    # Mirror input directory structure under out_dir to avoid name collisions
+    vp = Path(video_path)
+    dr = Path(data_root)
+    try:
+        rel = vp.relative_to(dr)
+        save_dir = Path(out_dir) / rel.parent
+    except Exception:
+        save_dir = Path(out_dir)
     result = process_video(
-        video_path=str(path),
-        out_dir=out_dir,
+        video_path=video_path,
+        out_dir=save_dir,
         target_fps=target_fps,
-        device=device,
+        device=_DEVICE,
         score_thresh=score_thresh,
         debug=debug,
         save_frames=save_frames,
         model3d=model3d,
         ckpt3d=ckpt3d,
-        det_2d_model=det_2d_model,
-        vitpose_processor=vitpose_processor,
-        vitpose_model=vitpose_model,
+        det_2d_model=_DET_MODEL,
+        vitpose_processor=_VITPOSE_PROCESSOR,
+        vitpose_model=_VITPOSE_MODEL,
     )
     return result.get("npz", "")
 
@@ -73,8 +94,7 @@ def main():
     ap.add_argument("--vitpose_repo", type=str, required=True, help="HuggingFace repo id for ViTPose")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--num_gpus", type=int, default=4)
-    ap.add_argument("--gpu_id", type=int, default=None, help="If set, process only this shard (0..num_gpus-1)")
-    ap.add_argument("--max_workers", type=int, default=8)
+    ap.add_argument("--workers_per_gpu", type=int, default=16)
     args = ap.parse_args()
 
     data_root = Path(args.data_root)
@@ -85,45 +105,43 @@ def main():
     if args.limit is not None:
         videos = videos[: args.limit]
 
-    if args.gpu_id is not None:
-        start, end = shard_indices(len(videos), args.num_gpus, args.gpu_id)
-        videos = videos[start:end]
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    # Create one process pool per GPU so each worker can initialize its own models on that GPU
+    executors = []
+    for gpu_id in range(args.num_gpus):
+        ex = futures.ProcessPoolExecutor(
+            max_workers=args.workers_per_gpu,
+            initializer=_init_worker,
+            initargs=(args.vitpose_repo, gpu_id),
+        )
+        executors.append(ex)
 
-    device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES", "") != "" else ("cuda" if torch.cuda.is_available() else "cpu")
-    # Build shared models once
-    det_2d_model = None
-    vitpose_processor = None
-    vitpose_model = None
-    vitpose_processor = AutoProcessor.from_pretrained(args.vitpose_repo)
-    vitpose_model = VitPoseForPoseEstimation.from_pretrained(args.vitpose_repo).to(device).eval()
-    det_2d_model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT").to(device).eval()
+    # Submit videos round-robin across GPU pools
+    pending = []
+    for i, v in enumerate(videos):
+        pool = executors[i % args.num_gpus]
+        fut = pool.submit(
+            _process_video_task,
+            str(v),
+            str(out_dir),
+            str(data_root),
+            args.target_fps,
+            args.score_thresh,
+            args.debug,
+            args.save_frames,
+            args.model3d,
+            args.ckpt3d,
+        )
+        pending.append(fut)
 
-    with futures.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-        tasks = [
-            ex.submit(
-                process_one,
-                v,
-                args.target_fps,
-                out_dir,
-                device,
-                args.score_thresh,
-                args.debug,
-                args.save_frames,
-                args.model3d,
-                args.ckpt3d,
-                det_2d_model,
-                vitpose_processor,
-                vitpose_model,
-            )
-            for v in videos
-        ]
-        for t in tasks:
-            try:
-                path_out = t.result()
-                print(f"Wrote {path_out}")
-            except Exception as e:
-                print(f"Failed: {e}")
+    for fut in pending:
+        try:
+            path_out = fut.result()
+            print(f"Wrote {path_out}")
+        except Exception as e:
+            print(f"Failed: {e}")
+
+    for ex in executors:
+        ex.shutdown(wait=True)
 
 
 if __name__ == "__main__":
