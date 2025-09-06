@@ -134,6 +134,15 @@ def build_motionagformer(MotionAGFormer, device, ckpt_path) -> torch.nn.Module:
 
 
 
+def load_motionagformer_from_path(model_class_path: str, ckpt_path: str, device) -> torch.nn.Module:
+    """
+    Dynamically import MotionAGFormer class via "module:Class" and build+load.
+    """
+    import importlib
+    module_path, class_name = model_class_path.split(":")
+    mod = importlib.import_module(module_path)
+    MotionAGFormer = getattr(mod, class_name)
+    return build_motionagformer(MotionAGFormer, device, ckpt_path)
 
 def lift_sequence_to_3d(
     seq_keypoints: np.ndarray,
