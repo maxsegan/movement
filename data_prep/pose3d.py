@@ -3,7 +3,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from .temporal import to_overlapping_clips
-from .constants import CLIP_LEN
+from .constants import CLIP_LEN, CLIP_HOP
 
 
 def infer_clips(
@@ -133,3 +133,75 @@ def build_motionagformer(MotionAGFormer, device, ckpt_path) -> torch.nn.Module:
     return model_3d
 
 
+
+
+def lift_sequence_to_3d(
+    seq_keypoints: np.ndarray,
+    seq_scores: np.ndarray,
+    width: int,
+    height: int,
+    model_3d: torch.nn.Module,
+    device,
+    use_overlap: bool = True,
+    clip_len: int = CLIP_LEN,
+    clip_hop: int = CLIP_HOP,
+):
+    """
+    High-level helper to lift a single tracked 2D sequence to 3D.
+
+    Args:
+        seq_keypoints: (1,F,17,2) absolute pixel coords
+        seq_scores: (1,F,17) confidence scores
+        width: source video width in pixels
+        height: source video height in pixels
+        model_3d: loaded MotionAGFormer (or compatible) model
+        device: torch device
+        use_overlap: use overlapping windows with averaging
+        clip_len: clip/window length
+        clip_hop: hop size when use_overlap=True
+
+    Returns:
+        y3d: (F,17,3) float32 array in model coordinates, root-centered
+    """
+    from .geometry import build_input_xyc
+    from .keypoints import flip_magformer
+
+    inp_xyc = build_input_xyc(seq_keypoints, seq_scores, width, height)  # (1,F,17,3)
+
+    if use_overlap:
+        y3d = infer_3d_with_overlap(
+            model_3d=model_3d,
+            inp_xyc=inp_xyc,
+            device=device,
+            flip_fn=flip_magformer,
+            target=clip_len,
+            hop=clip_hop,
+        )
+        return y3d
+
+    # Non-overlapping path (resample tail clips up to clip_len)
+    clips, idx_maps = [], []
+    T = inp_xyc.shape[1]
+    if T <= clip_len:
+        idx = np.floor(np.linspace(0, T - 1, clip_len)).astype(np.int32)
+        clips.append(inp_xyc[:, idx])
+        idx_maps.append(np.unique(idx, return_index=True)[1])
+    else:
+        for s in range(0, T, clip_len):
+            chunk = inp_xyc[:, s:s + clip_len]
+            if chunk.shape[1] < clip_len:
+                idx = np.floor(np.linspace(0, chunk.shape[1] - 1, clip_len)).astype(np.int32)
+                clips.append(chunk[:, idx])
+                idx_maps.append(np.unique(idx, return_index=True)[1])
+            else:
+                clips.append(chunk)
+                idx_maps.append(None)
+
+    all_3d = infer_clips(
+        model_3d=model_3d,
+        clips=clips,
+        device=device,
+        flip_fn=flip_magformer,
+        idx_maps=idx_maps,
+    )
+    return np.concatenate(all_3d, axis=0)
