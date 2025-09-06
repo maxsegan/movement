@@ -37,3 +37,24 @@ def to_clips(arr: np.ndarray, boxes_xyxy: np.ndarray, target: int = 243):
     return arr_cs, box_cs, idx_maps
 
 
+def turn_into_clips(keypoints: np.ndarray):
+    clips = []
+    n_frames = keypoints.shape[1]
+    if n_frames <= 243:
+        new_indices = resample(n_frames)
+        clips.append(keypoints[:, new_indices, ...])
+        downsample = np.unique(new_indices, return_index=True)[1]
+    else:
+        for start_idx in range(0, n_frames, 243):
+            keypoints_clip = keypoints[:, start_idx:start_idx + 243, ...]
+            clip_length = keypoints_clip.shape[1]
+            if clip_length != 243:
+                new_indices = resample(clip_length)
+                clips.append(keypoints_clip[:, new_indices, ...])
+                downsample = np.unique(new_indices, return_index=True)[1]
+            else:
+                clips.append(keypoints_clip)
+                downsample = None
+    return clips, downsample
+
+
