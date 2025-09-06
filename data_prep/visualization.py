@@ -197,3 +197,11 @@ def draw_h36m_on_video_frame(
         cv2.circle(canvas, p, radius, (0, 255, 255), -1, cv2.LINE_AA)
 
     return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
+
+def probe_video_size(raw_video_path: str) -> Tuple[int, int]:
+    cap = cv2.VideoCapture(raw_video_path)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    cap.release()
+    return height, width
