@@ -104,3 +104,20 @@ def test_combine_overlapping_predictions():
     assert np.allclose(combined[1], 1.5)
     assert np.allclose(combined[2], 1.5)
     assert np.allclose(combined[3], 2.0)
+
+
+def test_to_clips_resample_and_idx_map():
+    from data_prep.temporal import to_clips
+    N, F, J = 1, 5, 17
+    arr = np.zeros((N, F, J, 3), dtype=np.float32)
+    boxes = np.stack([np.array([0, 0, 10, 20], dtype=np.float32)] * F)
+    clips, box_clips, idx_maps = to_clips(arr, boxes, target=8)
+    assert len(clips) == 1 and clips[0].shape[1] == 8
+    assert idx_maps[0] is not None
+    down = np.unique(np.floor(np.linspace(0, F - 1, 8)).astype(np.int32), return_index=True)[1]
+    assert np.array_equal(idx_maps[0], down)
+
+
+def test_constants_clip_hop_default():
+    from data_prep.constants import CLIP_LEN, CLIP_HOP
+    assert CLIP_HOP == CLIP_LEN // 2

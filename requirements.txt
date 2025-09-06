@@ -18,3 +18,4 @@ pandas
 tqdm
 requests
 datasets
+h5py
