@@ -58,3 +58,44 @@ def turn_into_clips(keypoints: np.ndarray):
     return clips, downsample
 
 
+def to_overlapping_clips(arr: np.ndarray, target: int = 243, hop: int | None = None):
+    """
+    Create overlapping clips of fixed length `target` with hop size `hop`.
+
+    Args:
+        arr: (N,F,17,3)
+        target: window length in frames
+        hop: stride between window starts (default: target//2)
+
+    Returns:
+        clips: list of (N,target,17,3)
+        index_maps: list of (target,) int arrays mapping each clip timestep to original frame index [0..F-1]
+    """
+    if hop is None:
+        hop = target // 2
+    N, F, J, D = arr.shape
+    clips, index_maps = [], []
+    if F <= target:
+        # single clip via resampling
+        idx_local = np.floor(np.linspace(0, F - 1, target)).astype(np.int32)
+        clips.append(arr[:, idx_local])
+        index_maps.append(idx_local)
+        return clips, index_maps
+
+    start = 0
+    while start + target <= F:
+        idx_local = np.arange(start, start + target, dtype=np.int32)
+        clips.append(arr[:, idx_local])
+        index_maps.append(idx_local)
+        start += hop
+
+    # tail segment
+    if start < F:
+        tail_len = F - start
+        idx_tail = np.floor(np.linspace(0, tail_len - 1, target)).astype(np.int32) + start
+        clips.append(arr[:, idx_tail])
+        index_maps.append(idx_tail)
+
+    return clips, index_maps
+
+

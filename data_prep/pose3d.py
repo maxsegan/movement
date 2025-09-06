@@ -1,6 +1,7 @@
 from typing import List
 import numpy as np
 import torch
+from .temporal import to_overlapping_clips
 
 
 def infer_clips(
@@ -41,5 +42,46 @@ def infer_clips(
 
             outputs_3d.append(out[0].detach().cpu().numpy())
     return outputs_3d
+
+
+def combine_overlapping_predictions(
+    preds: List[np.ndarray],
+    index_maps: List[np.ndarray],
+) -> np.ndarray:
+    """
+    Average overlapping per-frame predictions into a single (F,17,3) array.
+    """
+    if len(preds) == 0:
+        return np.zeros((0, 17, 3), dtype=np.float32)
+    max_index = int(max(int(m.max()) for m in index_maps))
+    F = max_index + 1
+    accum = np.zeros((F, 17, 3), dtype=np.float64)
+    # shape (F,1,1) to broadcast with (F,17,3)
+    counts = np.zeros((F, 1, 1), dtype=np.float64)
+    for clip_pred, idx_map in zip(preds, index_maps):
+        for t_local, t_global in enumerate(idx_map):
+            accum[t_global] += clip_pred[t_local]
+            counts[t_global, 0, 0] += 1.0
+    counts[counts == 0.0] = 1.0
+    combined = (accum / counts).astype(np.float32)
+    return combined
+
+
+def infer_3d_with_overlap(
+    model_3d: torch.nn.Module,
+    inp_xyc: np.ndarray,
+    device,
+    flip_fn,
+    target: int = 243,
+    hop: int | None = None,
+) -> np.ndarray:
+    """
+    Full 3D pipeline: create overlapping clips from (1,F,17,3) input, run 3D inference with flip-ensemble,
+    and average overlapping predictions into a single (F,17,3) array.
+    """
+    clips, index_maps = to_overlapping_clips(inp_xyc, target=target, hop=hop)
+    preds = infer_clips(model_3d=model_3d, clips=clips, device=device, flip_fn=flip_fn, idx_maps=None)
+    combined = combine_overlapping_predictions(preds, [m for m in index_maps])
+    return combined
 
 
