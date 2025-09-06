@@ -44,3 +44,14 @@ def normalize_to_bbox(kpts_xy, boxes_xyxy):
     return out
 
 
+def build_input_xyc(seq_keypoints: np.ndarray, seq_scores: np.ndarray, width: int, height: int) -> np.ndarray:
+    """
+    Build normalized input tensor for 3D model: concatenate normalized xy with confidence.
+    Returns (1,F,17,3).
+    """
+    seq_xy = seq_keypoints.astype(np.float32)
+    seq_c = seq_scores[..., None].astype(np.float32)
+    xy_norm = normalize_screen(seq_xy, width, height)
+    return np.concatenate([xy_norm, seq_c], axis=-1)
+
+
