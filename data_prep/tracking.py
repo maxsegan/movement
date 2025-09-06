@@ -1,7 +1,11 @@
-from typing import List, Tuple
+from typing import List, Tuple, Union
+from pathlib import Path
+import json
 import numpy as np
 import cv2
 import torch
+import torchvision
+import torchvision.transforms as T
 
 from .boxes import iou_xyxy
 
@@ -66,4 +70,34 @@ def track_person_iou(
     cap.release()
     return frame_idxs, boxes_xyxy
 
+
+def run_tracking_and_save(
+    raw_video_path: str,
+    tracking_path: Union[str, Path],
+    device,
+    person_id: Union[str, int] = "1",
+    score_thresh: float = 0.7,
+    iou_thresh: float = 0.3,
+) -> Tuple[List[int], List[List[float]]]:
+    """
+    Create detector, run IoU-based tracking, and save tracking JSON to path.
+    Returns frame indices and boxes.
+    """
+    model_det = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT").to(device).eval()
+    base_tf = T.ToTensor()
+    def tf(img):
+        return base_tf(img).to(device)
+    frame_idxs, boxes_xyxy = track_person_iou(
+        raw_video_path=raw_video_path,
+        model_det=model_det,
+        transform=tf,
+        iou_thresh=iou_thresh,
+        score_thresh=score_thresh,
+    )
+    tracking = {str(person_id): {"frame_idxs": frame_idxs, "box": boxes_xyxy}}
+    tracking_path = Path(tracking_path)
+    tracking_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(tracking_path, "w") as f:
+        json.dump(tracking, f)
+    return frame_idxs, boxes_xyxy
 

@@ -3,6 +3,8 @@ import numpy as np
 import cv2
 import torch
 import PIL
+import json
+from pathlib import Path
 
 
 def infer_sequence(
@@ -52,5 +54,31 @@ def infer_sequence(
 
     cap.release()
     return all_keypoints, all_scores
+
+
+def infer_sequence_from_tracking(
+    raw_video_path: str,
+    tracking_path: Path | str,
+    image_processor,
+    model,
+    device,
+    person_id: str | int = "1",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load tracking json, run ViTPose across its frames, return (keypoints, scores, idxs).
+    """
+    with open(Path(tracking_path), "r") as f:
+        tracking = json.load(f)
+    idxs = np.array(tracking[str(person_id)]["frame_idxs"])  # (T,)
+    boxes_xyxy = tracking[str(person_id)]["box"]
+    all_keypoints, all_scores = infer_sequence(
+        raw_video_path=raw_video_path,
+        image_processor=image_processor,
+        model=model,
+        device=device,
+        idxs=idxs,
+        boxes_xyxy=boxes_xyxy,
+    )
+    return all_keypoints, all_scores, idxs
 
 
