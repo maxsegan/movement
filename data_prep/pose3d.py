@@ -1,7 +1,9 @@
 from typing import List
 import numpy as np
 import torch
+import torch.nn as nn
 from .temporal import to_overlapping_clips
+from .constants import CLIP_LEN
 
 
 def infer_clips(
@@ -83,5 +85,51 @@ def infer_3d_with_overlap(
     preds = infer_clips(model_3d=model_3d, clips=clips, device=device, flip_fn=flip_fn, idx_maps=None)
     combined = combine_overlapping_predictions(preds, [m for m in index_maps])
     return combined
+
+
+def build_motionagformer(MotionAGFormer, device, ckpt_path) -> torch.nn.Module:
+    n_layers, dim_in, dim_feat, dim_rep, dim_out = 16, 3, 128, 512, 3
+    mlp_ratio, act_layer = 4, nn.GELU
+    attn_drop, drop, drop_path = 0.0, 0.0, 0.0
+    use_layer_scale, layer_scale_init_value, use_adaptive_fusion = True, 1e-5, True
+    num_heads, qkv_bias, qkv_scale = 8, False, None
+    hierarchical = False
+    use_temporal_similarity, neighbour_num, temporal_connection_len = True, 2, 1
+    use_tcn, graph_only = False, False
+    n_frames = CLIP_LEN
+
+    model_3d = nn.DataParallel(
+        MotionAGFormer(
+            n_layers=n_layers,
+            dim_in=dim_in,
+            dim_feat=dim_feat,
+            dim_rep=dim_rep,
+            dim_out=dim_out,
+            mlp_ratio=mlp_ratio,
+            act_layer=act_layer,
+            attn_drop=attn_drop,
+            drop=drop,
+            drop_path=drop_path,
+            use_layer_scale=use_layer_scale,
+            layer_scale_init_value=layer_scale_init_value,
+            use_adaptive_fusion=use_adaptive_fusion,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qkv_scale=qkv_scale,
+            hierarchical=hierarchical,
+            use_temporal_similarity=use_temporal_similarity,
+            neighbour_num=neighbour_num,
+            temporal_connection_len=temporal_connection_len,
+            use_tcn=use_tcn,
+            graph_only=graph_only,
+            n_frames=n_frames,
+        )
+    ).to(device)
+
+    pre_dict = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+    assert 'model' in pre_dict, "Checkpoint missing 'model' key"
+    model_3d.load_state_dict(pre_dict['model'], strict=True)
+    model_3d.eval()
+    return model_3d
 
 
