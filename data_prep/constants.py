@@ -8,3 +8,11 @@ H36M_J = np.array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16], dtype=np.int32)
 H36M_LR_EDGE_MASK = np.array([0,0,0,1,1,1,0,0,0,0,1,1,1,0,0,0], dtype=bool)
 COLOR_L_BGR = (0, 255, 0)
 COLOR_R_BGR = (255, 0, 0)
+
+# Clip/windowing defaults
+CLIP_LEN = 243
+CLIP_HOP = CLIP_LEN // 2
+
+# Flip-ensemble joint indices (H36M order)
+FLIP_LEFT_IDXS = [4, 5, 6, 11, 12, 13]
+FLIP_RIGHT_IDXS = [1, 2, 3, 14, 15, 16]

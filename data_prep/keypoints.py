@@ -1,7 +1,8 @@
 import numpy as np
+from .constants import FLIP_LEFT_IDXS, FLIP_RIGHT_IDXS
 
 
-def flip_magformer(t, left=[4,5,6,11,12,13], right=[1,2,3,14,15,16]):
+def flip_magformer(t, left=FLIP_LEFT_IDXS, right=FLIP_RIGHT_IDXS):
     t2 = t.clone()
     t2[..., 0] *= -1
     t2[..., left, :] = t[..., right, :]
