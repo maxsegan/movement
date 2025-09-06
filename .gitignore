@@ -4,3 +4,4 @@ models/
 MotionAGFormer/
 .venv/
 __pycache__/
+*.pyc
