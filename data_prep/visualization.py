@@ -1,6 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from IPython.display import HTML, display
+import cv2
+from .constants import H36M_I, H36M_J, H36M_LR_EDGE_MASK as LR, COLOR_L_BGR as COLOR_L, COLOR_R_BGR as COLOR_R
 
 
 def visualize_layered_heatmaps(heatmaps: np.ndarray):
@@ -153,3 +155,45 @@ def overlay_pose_and_bbox(rgb_frame: np.ndarray, xy: np.ndarray, scores: np.ndar
     annot_img = vertex_annotator.annotate(scene=annot_img, key_points=keypoints)
     annot_img = bounding_box_annotator.annotate(scene=annot_img, detections=detections)
     return annot_img
+
+
+def draw_h36m_on_video_frame(
+    raw_video_path: str,
+    idxs: np.ndarray,
+    seq_keypoints: np.ndarray,
+    seq_scores: np.ndarray,
+    seq_idx: int = 0,
+    conf_thresh: float = 0.15,
+    radius: int = 3,
+    thickness: int = 2,
+) -> np.ndarray:
+    cap = cv2.VideoCapture(raw_video_path)
+    frame_no = int(idxs[seq_idx])
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+    ok, frame_bgr = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError(f"Failed to read frame {frame_no}")
+
+    pts = seq_keypoints[0, seq_idx].copy()
+    scores = seq_scores[0, seq_idx].copy()
+    h, w = frame_bgr.shape[:2]
+    pts[:, 0] = np.clip(pts[:, 0], 0, w - 1)
+    pts[:, 1] = np.clip(pts[:, 1], 0, h - 1)
+
+    canvas = frame_bgr.copy()
+    for i, j, is_left in zip(H36M_I, H36M_J, LR):
+        if scores[i] < conf_thresh or scores[j] < conf_thresh:
+            continue
+        p1 = tuple(np.round(pts[i]).astype(int))
+        p2 = tuple(np.round(pts[j]).astype(int))
+        color = COLOR_L if is_left else COLOR_R
+        cv2.line(canvas, p1, p2, color, thickness, cv2.LINE_AA)
+
+    for k in range(pts.shape[0]):
+        if scores[k] < conf_thresh:
+            continue
+        p = tuple(np.round(pts[k]).astype(int))
+        cv2.circle(canvas, p, radius, (0, 255, 255), -1, cv2.LINE_AA)
+
+    return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
