@@ -135,3 +135,21 @@ def overlay_3d_on_video_inline(
     display(HTML(html))
     plt.close(fig)
     print(f"Rendered inline 3D overlay (no files). frames={len(frames_rgb)} stride={stride} scale={resize_scale} fps~{fps_out:.1f}")
+
+
+def overlay_pose_and_bbox(rgb_frame: np.ndarray, xy: np.ndarray, scores: np.ndarray, xyxy: np.ndarray) -> np.ndarray:
+    import numpy as np
+    import supervision as sv
+
+    annot_img = rgb_frame.copy()
+    keypoints = sv.KeyPoints(xy=xy.astype(np.float32), confidence=scores.astype(np.float32))
+    detections = sv.Detections(xyxy=np.expand_dims(np.array(xyxy, dtype=np.float32), axis=0))
+
+    edge_annotator = sv.EdgeAnnotator(color=sv.Color.GREEN, thickness=3)
+    vertex_annotator = sv.VertexAnnotator(color=sv.Color.RED, radius=2)
+    bounding_box_annotator = sv.BoxAnnotator(color=sv.Color.BLUE, color_lookup=sv.ColorLookup.INDEX, thickness=1)
+
+    annot_img = edge_annotator.annotate(scene=annot_img, key_points=keypoints)
+    annot_img = vertex_annotator.annotate(scene=annot_img, key_points=keypoints)
+    annot_img = bounding_box_annotator.annotate(scene=annot_img, detections=detections)
+    return annot_img
