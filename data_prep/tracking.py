@@ -1,5 +1,9 @@
 from typing import List, Tuple
 import numpy as np
+import cv2
+import torch
+
+from .boxes import iou_xyxy
 
 
 def track_person_iou(
@@ -16,11 +20,6 @@ def track_person_iou(
         frame_idxs: list of frame indices where a detection was chosen
         boxes_xyxy: list of [x1,y1,x2,y2] boxes per chosen frame
     """
-    import cv2
-    import torch
-
-    from .boxes import iou_xyxy
-
     frame_idxs: List[int] = []
     boxes_xyxy: List[List[float]] = []
     last_box = None
