@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
@@ -10,6 +10,7 @@ from data_prep.vitpose import infer_sequence
 from data_prep.pipeline.sampling import probe_video_meta, read_frames_by_indices, sample_indices_for_fps
 from data_prep.pose3d import load_motionagformer_from_path, lift_sequence_to_3d
 from data_prep import clip_filtering as filt
+from data_prep.video_action_description import VideoActionDescriber, ActionDescription
 
 
 def process_video(
@@ -26,6 +27,9 @@ def process_video(
     det_2d_model: object | None = None,
     vitpose_processor: object | None = None,
     vitpose_model: object | None = None,
+    # VLM for action description
+    action_describer: Optional[VideoActionDescriber] = None,
+    enable_action_description: bool = False,
 ) -> Dict[str, str]:
     meta = probe_video_meta(video_path)
     idxs = sample_indices_for_fps(meta["frames"], meta["fps"], target_fps=target_fps)
@@ -94,10 +98,53 @@ def process_video(
         except Exception as e:
             y3d = None
 
+    # Generate action descriptions if enabled
+    action_descriptions = []
+    if enable_action_description and action_describer and frames.shape[0] > 0:
+        try:
+            # Process video with tracking data to get descriptions
+            descriptions = action_describer.process_video_with_tracking(
+                video_path=video_path,
+                keypoints=seq_k,
+                bboxes=det["bboxes"],
+                indices=idxs,
+                segment_duration=3.0,
+                fps=target_fps
+            )
+
+            # Convert to serializable format
+            for desc in descriptions:
+                action_descriptions.append({
+                    'frames': desc.frame_indices,
+                    'description': desc.description,
+                    'confidence': desc.confidence
+                })
+        except Exception as e:
+            print(f"Error generating action descriptions: {e}")
+
     # Save outputs
     vp = Path(video_path)
     out_dir.mkdir(parents=True, exist_ok=True)
     npz_path = out_dir / f"{vp.stem}.npz"
+
+    # Prepare action descriptions for saving
+    if action_descriptions:
+        # Convert dataclass to dictionary for JSON serialization
+        import json
+        from dataclasses import asdict
+
+        # Convert ActionDescription objects to dictionaries
+        if hasattr(action_descriptions[0], '__dataclass_fields__'):
+            # It's a dataclass, convert to dict
+            action_dicts = [asdict(desc) for desc in action_descriptions]
+        else:
+            # Already a dict or other format
+            action_dicts = action_descriptions
+
+        action_json = json.dumps(action_dicts, default=str)  # Use default=str for any remaining numpy types
+    else:
+        action_json = "[]"
+
     np.savez_compressed(
         npz_path,
         indices=idxs.astype(np.int32),
@@ -109,6 +156,7 @@ def process_video(
         density_ok=np.array([density_ok], dtype=bool),
         dynamic_ok=np.array([dynamic_ok], dtype=bool),
         quality=np.array([quality], dtype=np.float32),
+        action_descriptions=np.array([action_json], dtype=object),
     )
 
     # Optional frame dump
