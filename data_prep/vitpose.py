@@ -35,12 +35,47 @@ def infer_sequence(
 
         rgb_frame = frame_bgr[:, :, ::-1]
         bbox_xyxy = np.array(boxes_xyxy[t], dtype=np.float32)
+
+        # Skip frames with invalid bounding boxes
+        if np.any(np.isnan(bbox_xyxy)) or np.any(np.isinf(bbox_xyxy)):
+            continue
+
+        # Check for valid bbox dimensions
+        width = bbox_xyxy[2] - bbox_xyxy[0]
+        height = bbox_xyxy[3] - bbox_xyxy[1]
+        if width <= 0 or height <= 0:
+            continue
+
+        # Add buffer around bounding box (20% on each side)
+        buffer_ratio = 0.2
+        buffer_x = width * buffer_ratio
+        buffer_y = height * buffer_ratio
+
+        # Calculate buffered box coordinates
+        x1_buffered = max(0, int(bbox_xyxy[0] - buffer_x))
+        y1_buffered = max(0, int(bbox_xyxy[1] - buffer_y))
+        x2_buffered = min(rgb_frame.shape[1], int(bbox_xyxy[2] + buffer_x))
+        y2_buffered = min(rgb_frame.shape[0], int(bbox_xyxy[3] + buffer_y))
+
+        # Crop the image to the buffered bounding box
+        cropped_frame = rgb_frame[y1_buffered:y2_buffered, x1_buffered:x2_buffered]
+
+        # If crop is too small, skip
+        if cropped_frame.shape[0] < 10 or cropped_frame.shape[1] < 10:
+            continue
+
+        # Adjust bbox coordinates relative to the cropped image
         person_boxes_coco = np.expand_dims(
-            np.array([bbox_xyxy[0], bbox_xyxy[1], bbox_xyxy[2] - bbox_xyxy[0], bbox_xyxy[3] - bbox_xyxy[1]], dtype=np.float32),
+            np.array([
+                bbox_xyxy[0] - x1_buffered,  # x relative to crop
+                bbox_xyxy[1] - y1_buffered,  # y relative to crop
+                width,
+                height
+            ], dtype=np.float32),
             axis=0,
         )
 
-        image = PIL.Image.fromarray(rgb_frame)
+        image = PIL.Image.fromarray(cropped_frame)
         pixel_values = image_processor(image, boxes=[person_boxes_coco], return_tensors="pt").pixel_values
         dataset_index = torch.tensor([0], device=device)
 
@@ -49,7 +84,16 @@ def infer_sequence(
             outputs = model(pixel_values, dataset_index=dataset_index)
         pose_results = image_processor.post_process_pose_estimation(outputs, boxes=[person_boxes_coco])
         image_pose_result = pose_results[0][0]
-        all_keypoints[0, t] = image_pose_result["keypoints"].cpu().numpy()
+
+        # Get keypoints relative to cropped image
+        keypoints_crop = image_pose_result["keypoints"].cpu().numpy()
+
+        # Transform keypoints back to original image coordinates
+        keypoints_orig = keypoints_crop.copy()
+        keypoints_orig[:, 0] += x1_buffered  # Add back x offset
+        keypoints_orig[:, 1] += y1_buffered  # Add back y offset
+
+        all_keypoints[0, t] = keypoints_orig
         all_scores[0, t] = image_pose_result["scores"].cpu().numpy()
 
     cap.release()
