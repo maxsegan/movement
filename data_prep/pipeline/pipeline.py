@@ -10,7 +10,8 @@ from data_prep.vitpose import infer_sequence
 from data_prep.pipeline.sampling import probe_video_meta, read_frames_by_indices, sample_indices_for_fps
 from data_prep.pose3d import load_motionagformer_from_path, lift_sequence_to_3d
 from data_prep import clip_filtering as filt
-from data_prep.video_action_description import VideoActionDescriber, ActionDescription
+from data_prep.video_action_description import FastVideoActionDescriber as VideoActionDescriber, ActionDescription
+from data_prep.bytetrack import ByteTracker, Track
 
 
 def detect_hard_cuts(frames, threshold=0.4):
@@ -60,138 +61,127 @@ def process_video(
     idxs = sample_indices_for_fps(meta["frames"], meta["fps"], target_fps=target_fps)
     frames = read_frames_by_indices(video_path, idxs)
 
+    # For debug mode, we need ALL frames for proper visualization
+    all_frames = None
+    if debug:
+        all_frame_indices = np.arange(meta["frames"])
+        all_frames = read_frames_by_indices(video_path, all_frame_indices)
+
     # ViTPose path using existing module (requires precomputed boxes per frame)
-    # Detect hard cuts first
+    # Detect hard cuts first (using sampled frames is fine for this)
     hard_cuts = detect_hard_cuts(frames)
     has_hard_cuts = len(hard_cuts) > 0
 
+    # Run tracking on ALL frames if in debug mode, otherwise just sampled frames
+    frames_to_track = all_frames if (debug and all_frames is not None) else frames
+
     boxes_xyxy = np.full((frames.shape[0], 4), np.nan, dtype=np.float32)
+    boxes_xyxy_all_frames = None  # For debug visualization
+
     from torchvision.transforms.functional import to_tensor
 
-    # Import IoU function for tracking
-    from data_prep.boxes import iou_xyxy
+    # Initialize ByteTracker for multi-object tracking
+    tracker = ByteTracker(
+        track_thresh=0.5,     # High confidence threshold
+        track_buffer=30,      # Keep lost tracks for 30 frames
+        match_thresh=0.3,     # Lower IoU threshold for better tracking during posture changes
+        min_box_area=100      # Minimum box area
+    )
+
+    # Store all tracks for visualization
+    all_tracks_per_frame = []
+    main_track_id = None
+    tracking_switches = []
 
     if det_2d_model is not None:
-        # SIMPLE SINGLE-PERSON LOCK TRACKING
-        # Pick ONE person at the start and NEVER switch unless completely lost
-        target_box = None
-        target_initialized = False
-        consecutive_lost_frames = 0
-        max_lost_frames = 15  # Be patient before giving up
+        if debug and all_frames is not None:
+            # In debug mode: track ALL frames for smooth visualization
+            boxes_xyxy_all_frames = np.full((all_frames.shape[0], 4), np.nan, dtype=np.float32)
 
         with torch.no_grad():
-            for i in range(frames.shape[0]):
-                img = to_tensor(frames[i]).to(device)
+            for i in range(frames_to_track.shape[0]):
+                img = to_tensor(frames_to_track[i]).to(device)
                 out = det_2d_model([img])[0]
 
-                chosen_box = None
+                # Reset tracker at hard cuts
+                if i in hard_cuts:
+                    tracker = ByteTracker(
+                        track_thresh=0.5,
+                        track_buffer=30,
+                        match_thresh=0.3,  # Lower IoU threshold
+                        min_box_area=100
+                    )
+                    main_track_id = None
+
+                # Get all person detections
+                person_boxes = []
+                person_scores = []
 
                 if out["boxes"].numel() > 0:
                     labels = out["labels"].detach().cpu().numpy()
                     scores = out["scores"].detach().cpu().numpy()
                     boxes = out["boxes"].detach().cpu().numpy()
 
-                    # Filter for persons only
-                    mask = (labels == 1) & (scores >= 0.3)  # Lower threshold to not lose people
+                    # Filter for persons only (class 1 in COCO) with higher confidence
+                    mask = (labels == 1) & (scores >= 0.5)  # Increased from 0.3 to avoid false positives
                     idx = np.flatnonzero(mask)
 
                     if idx.size > 0:
                         person_boxes = boxes[idx]
                         person_scores = scores[idx]
-
-                        if not target_initialized:
-                            # FIRST FRAME: Pick the most prominent person
-                            frame_h, frame_w = frames[i].shape[:2]
-                            best_idx = 0
-                            best_score = -1
-
-                            for j, box in enumerate(person_boxes):
-                                # Prefer larger, more central, higher confidence persons
-                                area = (box[2] - box[0]) * (box[3] - box[1])
-                                size_score = area / (frame_w * frame_h)
-
-                                center_x = (box[0] + box[2]) / 2
-                                center_y = (box[1] + box[3]) / 2
-                                center_dist = np.sqrt((center_x - frame_w/2)**2 + (center_y - frame_h/2)**2)
-                                center_score = 1.0 - (center_dist / (frame_w/2))
-
-                                # Combined score: confidence + size + centrality
-                                total_score = person_scores[j] * 0.4 + size_score * 5.0 + center_score * 0.2
-
-                                if total_score > best_score:
-                                    best_score = total_score
-                                    best_idx = j
-
-                            # Lock onto this person
-                            target_box = person_boxes[best_idx].copy()
-                            chosen_box = target_box.copy()
-                            target_initialized = True
-                            consecutive_lost_frames = 0
-
-                        else:
-                            # TRACKING: Find the same person we locked onto
-                            # Calculate IoU with all candidates
-                            ious = np.array([iou_xyxy(target_box, box) for box in person_boxes])
-
-                            # RULE 1: Any IoU overlap > 0 means it's likely our person
-                            overlap_indices = np.where(ious > 0)[0]
-
-                            if len(overlap_indices) > 0:
-                                # Among overlapping boxes, pick the one with highest IoU
-                                best_overlap_idx = overlap_indices[np.argmax(ious[overlap_indices])]
-                                chosen_box = person_boxes[best_overlap_idx].copy()
-                                target_box = chosen_box.copy()  # Update target to latest position
-                                consecutive_lost_frames = 0
-
-                            else:
-                                # No overlap - find closest box by center distance
-                                target_center = np.array([(target_box[0] + target_box[2])/2,
-                                                         (target_box[1] + target_box[3])/2])
-
-                                min_dist = float('inf')
-                                closest_idx = -1
-
-                                for j, box in enumerate(person_boxes):
-                                    center = np.array([(box[0] + box[2])/2, (box[1] + box[3])/2])
-                                    dist = np.linalg.norm(center - target_center)
-
-                                    if dist < min_dist:
-                                        min_dist = dist
-                                        closest_idx = j
-
-                                # Only accept if reasonably close (within ~10% of frame width)
-                                frame_w = frames[i].shape[1]
-                                if closest_idx >= 0 and min_dist < frame_w * 0.15:
-                                    chosen_box = person_boxes[closest_idx].copy()
-                                    target_box = chosen_box.copy()
-                                    consecutive_lost_frames = 0
-                                else:
-                                    # Too far - we've lost them
-                                    consecutive_lost_frames += 1
                     else:
-                        # No person detections at all
-                        if target_initialized:
-                            consecutive_lost_frames += 1
+                        person_boxes = np.empty((0, 4))
+                        person_scores = np.empty(0)
                 else:
-                    # No detections at all
-                    if target_initialized:
-                        consecutive_lost_frames += 1
+                    person_boxes = np.empty((0, 4))
+                    person_scores = np.empty(0)
 
-                # Check for hard cuts - reset tracking
-                if i in hard_cuts:
-                    target_box = None
-                    target_initialized = False
-                    consecutive_lost_frames = 0
+                # Update tracker with all detections
+                active_tracks = tracker.update(person_boxes, person_scores)
+                all_tracks_per_frame.append(active_tracks)
 
-                # If lost for too long, reset (but not at hard cuts)
-                elif consecutive_lost_frames > max_lost_frames:
-                    target_box = None
-                    target_initialized = False
-                    consecutive_lost_frames = 0
+                # Select main track to follow
+                if active_tracks:
+                    # First frame with tracks: pick the best one
+                    if main_track_id is None:
+                        main_track = tracker.get_main_track()
+                        if main_track:
+                            main_track_id = main_track.track_id
+                            if debug and all_frames is not None:
+                                boxes_xyxy_all_frames[i] = main_track.bbox.astype(np.float32)
+                            # Map to sampled frame if needed
+                            if i in idxs:
+                                sampled_idx = np.where(idxs == i)[0][0]
+                                boxes_xyxy[sampled_idx] = main_track.bbox.astype(np.float32)
+                    else:
+                        # Subsequent frames: stick with the same track ID
+                        main_track = None
+                        for track in active_tracks:
+                            if track.track_id == main_track_id:
+                                main_track = track
+                                break
 
-                # Store the chosen box
-                if chosen_box is not None:
-                    boxes_xyxy[i] = chosen_box.astype(np.float32)
+                        if main_track:
+                            # Found our tracked person
+                            if debug and all_frames is not None:
+                                boxes_xyxy_all_frames[i] = main_track.bbox.astype(np.float32)
+                            # Map to sampled frame if needed
+                            if i in idxs:
+                                sampled_idx = np.where(idxs == i)[0][0]
+                                boxes_xyxy[sampled_idx] = main_track.bbox.astype(np.float32)
+                        else:
+                            # Lost our main track - pick a new one
+                            main_track = tracker.get_main_track()
+                            if main_track:
+                                # Only count as a switch if we had to pick a different person
+                                tracking_switches.append(i)
+                                main_track_id = main_track.track_id
+                                if debug and all_frames is not None:
+                                    boxes_xyxy_all_frames[i] = main_track.bbox.astype(np.float32)
+                                # Map to sampled frame if needed
+                                if i in idxs:
+                                    sampled_idx = np.where(idxs == i)[0][0]
+                                    boxes_xyxy[sampled_idx] = main_track.bbox.astype(np.float32)
 
     if vitpose_processor is None or vitpose_model is None:
         raise RuntimeError("ViTPose processor/model must be provided to process_video")
@@ -204,17 +194,25 @@ def process_video(
         idxs=idxs,
         boxes_xyxy=boxes_xyxy,
     )
-    # Prepare tracking confidence array (all zeros since we removed confidence tracking)
-    tracking_conf_array = np.zeros((frames.shape[0],), dtype=np.float32)
+    # Store tracking data for debug visualization
+    tracking_data = {
+        'all_tracks_per_frame': all_tracks_per_frame if 'all_tracks_per_frame' in locals() else [],
+        'main_track_id': main_track_id if 'main_track_id' in locals() else None,
+        'boxes_all_frames': boxes_xyxy_all_frames if debug and boxes_xyxy_all_frames is not None else None,
+        'all_frames': all_frames if debug and all_frames is not None else None,
+        'sampled_indices': idxs
+    }
 
     det = dict(
         keypoints=kpts,
         scores=scrs,
         bboxes=boxes_xyxy,
-        det_scores=tracking_conf_array,
+        det_scores=np.zeros(frames.shape[0], dtype=np.float32),  # Placeholder
         indices=idxs.astype(np.int32),
         has_hard_cuts=has_hard_cuts if 'has_hard_cuts' in locals() else False,
         hard_cut_frames=hard_cuts if 'hard_cuts' in locals() else [],
+        tracking_switches=tracking_switches if 'tracking_switches' in locals() else [],
+        tracking_data=tracking_data if 'tracking_data' in locals() else {},
     )
 
     # Convert COCO->H36M
@@ -227,10 +225,10 @@ def process_video(
     seq_k = h36m_kpts[0]
     seq_s = h36m_scores[0]
 
-    # Filtering metrics (tag only for now)
-    density_ok = filt.has_sufficient_keypoint_density(seq_k)
-    dynamic_ok = filt.is_sequence_dynamic(seq_k)
-    quality = filt.sequence_quality_score(seq_k)
+    # Filtering metrics - set defaults for now (actual validation happens in validate_kinetics.py)
+    density_ok = True
+    dynamic_ok = True
+    quality = 1.0
 
     # Optional 3D lifting
     y3d = None
@@ -303,6 +301,7 @@ def process_video(
         has_hard_cuts=np.array([det.get("has_hard_cuts", False)], dtype=bool),
         hard_cut_frames=np.array(det.get("hard_cut_frames", []), dtype=np.int32),
         tracking_confidence=det.get("det_scores", np.zeros(frames.shape[0], dtype=np.float32)),
+        tracking_switches=np.array(det.get("tracking_switches", []), dtype=np.int32),
     )
 
     # Optional frame dump
@@ -317,20 +316,87 @@ def process_video(
     if debug and frames.shape[0] > 0:
         debug_path = out_dir / f"{vp.stem}_debug.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(debug_path), fourcc, target_fps, (frames.shape[2], frames.shape[1]))
-        # Draw simple COCO-like points (use available data)
-        for t in range(frames.shape[0]):
-            img = cv2.cvtColor(frames[t], cv2.COLOR_RGB2BGR)
-            bb = det["bboxes"][t]
-            if np.all(np.isfinite(bb)) and np.any(bb != 0):
-                x1, y1, x2, y2 = [int(v) for v in bb]
-                cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-            pts = seq_k[t]
-            sc = seq_s[t]
-            for j in range(pts.shape[0]):
-                if sc[j] >= 0.15:
-                    p = (int(round(pts[j, 0])), int(round(pts[j, 1])))
-                    cv2.circle(img, p, 2, (0, 255, 255), -1, cv2.LINE_AA)
+        # Use original FPS for debug video if we have all frames
+        debug_fps = meta["fps"] if all_frames is not None else target_fps
+        debug_frames = all_frames if all_frames is not None else frames
+        writer = cv2.VideoWriter(str(debug_path), fourcc, debug_fps, (debug_frames.shape[2], debug_frames.shape[1]))
+
+        # H36M skeleton connections for visualization
+        h36m_connections = [
+            (0, 1), (1, 2), (2, 3),  # Right leg
+            (0, 4), (4, 5), (5, 6),  # Left leg
+            (0, 7), (7, 8), (8, 9), (9, 10),  # Spine to head
+            (8, 11), (11, 12), (12, 13),  # Right arm
+            (8, 14), (14, 15), (15, 16),  # Left arm
+        ]
+
+        # Create mapping from all frames to sampled keypoints
+        keypoint_mapping = {}
+        for idx, frame_no in enumerate(idxs):
+            keypoint_mapping[int(frame_no)] = idx
+
+        for t in range(debug_frames.shape[0]):
+            img = cv2.cvtColor(debug_frames[t], cv2.COLOR_RGB2BGR)
+
+            # Draw ALL detected people with colored boxes
+            if 'tracking_data' in det and t < len(det['tracking_data'].get('all_tracks_per_frame', [])):
+                tracks = det['tracking_data']['all_tracks_per_frame'][t]
+                main_id = det['tracking_data'].get('main_track_id')
+
+                for track in tracks:
+                    x1, y1, x2, y2 = [int(v) for v in track.bbox]
+                    color = track.color
+                    thickness = 3 if track.track_id == main_id else 1
+
+                    # Draw box with track ID
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+                    # Draw track ID
+                    label = f"ID:{track.track_id}"
+                    if track.track_id == main_id:
+                        label += " [MAIN]"
+
+                    # Background for text
+                    (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                    cv2.rectangle(img, (x1, y1-text_h-4), (x1+text_w+4, y1), color, -1)
+                    cv2.putText(img, label, (x1+2, y1-2),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Draw skeleton for main person (only on sampled frames)
+            if t in keypoint_mapping:
+                kpt_idx = keypoint_mapping[t]
+                bb = det["bboxes"][kpt_idx]
+                if np.all(np.isfinite(bb)) and np.any(bb != 0):
+                    # Draw main person's skeleton
+                    pts = seq_k[kpt_idx]
+                    sc = seq_s[kpt_idx]
+
+                    # Draw skeleton connections
+                    for conn in h36m_connections:
+                        if sc[conn[0]] >= 0.15 and sc[conn[1]] >= 0.15:
+                            pt1 = (int(round(pts[conn[0], 0])), int(round(pts[conn[0], 1])))
+                            pt2 = (int(round(pts[conn[1], 0])), int(round(pts[conn[1], 1])))
+                            cv2.line(img, pt1, pt2, (0, 255, 0), 2, cv2.LINE_AA)
+
+                    # Draw joints
+                    for j in range(pts.shape[0]):
+                        if sc[j] >= 0.15:
+                            p = (int(round(pts[j, 0])), int(round(pts[j, 1])))
+                            cv2.circle(img, p, 3, (0, 255, 255), -1, cv2.LINE_AA)
+                            cv2.circle(img, p, 4, (0, 0, 0), 1, cv2.LINE_AA)  # Border
+
+            # Add frame info
+            cv2.putText(img, f"Frame {t}/{debug_frames.shape[0]-1}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+            if t in hard_cuts:
+                cv2.putText(img, "HARD CUT", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
+            if t in tracking_switches:
+                cv2.putText(img, "TRACKING SWITCH", (10, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
+
             writer.write(img)
         writer.release()
 

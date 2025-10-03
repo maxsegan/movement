@@ -1,9 +1,6 @@
 """
-Improved clip validation with fixes for the identified issues:
-1. Motion detection that understands stationary exercises (tai chi, yoga, etc.)
-2. Better tracking consistency that allows for intentional subject changes
-3. More lenient body coverage thresholds for valid partial visibility
-4. Activity-aware validation
+Clip validation based purely on pose quality and movement metrics.
+No activity-specific logic - all decisions based on detected poses.
 """
 
 import numpy as np
@@ -11,75 +8,31 @@ from typing import Tuple, List, Optional
 from data_prep.boxes import iou_xyxy
 
 
-# Activity categories that are typically low-motion or stationary
-LOW_MOTION_ACTIVITIES = {
-    'tai_chi', 'yoga', 'meditation', 'standing', 'sitting', 'waiting',
-    'reading', 'watching', 'listening', 'thinking', 'praying', 'sleeping'
-}
-
-# Activities that involve primarily hand/arm movements
-HAND_ONLY_ACTIVITIES = {
-    'tapping_pen', 'writing', 'typing', 'drawing', 'painting', 'knitting',
-    'sewing', 'playing_cards', 'folding_paper', 'origami', 'sign_language'
-}
-
-# Activities with dynamic movement patterns
-DYNAMIC_ACTIVITIES = {
-    'zumba', 'dancing', 'spinning_poi', 'spinning_plates', 'juggling',
-    'gymnastics', 'parkour', 'martial_arts', 'capoeira', 'breakdancing'
-}
-
-# Exercise activities
-EXERCISE_ACTIVITIES = {
-    'mountain_climber', 'push_ups', 'sit_ups', 'squats', 'lunges',
-    'burpees', 'planking', 'stretching', 'pilates', 'aerobics'
-}
-
-
-def get_activity_type(video_path: str) -> str:
-    """Extract activity type from video path."""
-    import os
-    # Parse path like: .../activity_name/video_id.mp4
-    parts = video_path.replace('\\', '/').split('/')
-    for part in parts:
-        # Remove special characters and convert to lowercase
-        clean_part = part.replace('_', ' ').replace('-', ' ').replace('(', '').replace(')', '').lower()
-        for activity_set in [LOW_MOTION_ACTIVITIES, HAND_ONLY_ACTIVITIES,
-                            DYNAMIC_ACTIVITIES, EXERCISE_ACTIVITIES]:
-            for activity in activity_set:
-                if activity.replace('_', ' ') in clean_part:
-                    return activity
-    return 'unknown'
-
-
-def check_minimum_body_coverage_improved(
+def check_minimum_body_coverage(
     keypoints: np.ndarray,
     scores: np.ndarray,
     min_confidence: float = 0.3,
-    activity_type: Optional[str] = None
+    min_valid_ratio: float = 0.4
 ) -> Tuple[bool, str]:
     """
-    Improved body coverage check that's more lenient for valid partial visibility.
+    Check if enough of the body is visible in enough frames.
+
+    Args:
+        keypoints: (T, 17, 2) array of 2D keypoints
+        scores: (T, 17) array of confidence scores
+        min_confidence: Minimum confidence for a keypoint to be considered valid
+        min_valid_ratio: Minimum ratio of frames that need valid body coverage
+
+    Returns:
+        (is_valid, reason_if_not)
     """
     if keypoints.shape[0] == 0:
         return False, "NO_KEYPOINTS"
 
-    # Adjust thresholds based on activity type
-    if activity_type in HAND_ONLY_ACTIVITIES:
-        # For hand-only activities, we only need hands/wrists visible
-        required_joints = {9, 10}  # Wrists
-        min_required = 1
-        min_valid_ratio = 0.3
-    elif activity_type in LOW_MOTION_ACTIVITIES:
-        # For stationary activities, be more lenient
-        required_joints = {0, 5, 6, 11, 12}  # Nose, shoulders, hips
-        min_required = 2
-        min_valid_ratio = 0.4
-    else:
-        # Standard requirements
-        required_joints = {0, 5, 6, 11, 12}  # Nose, shoulders, hips
-        min_required = 3
-        min_valid_ratio = 0.5
+    # Core joints that indicate a person is present
+    # Nose(0), shoulders(5,6), hips(11,12)
+    core_joints = {0, 5, 6, 11, 12}
+    min_core_joints = 3
 
     valid_frames = 0
     total_frames = keypoints.shape[0]
@@ -91,53 +44,46 @@ def check_minimum_body_coverage_improved(
         # Count valid keypoints
         valid_mask = (frame_kpts[:, 0] > 0) & (frame_kpts[:, 1] > 0) & (frame_scores > min_confidence)
 
-        # Check if required joints are present
-        required_present = sum(valid_mask[j] for j in required_joints)
+        # Check if core joints are present
+        core_present = sum(valid_mask[j] for j in core_joints)
 
-        if required_present >= min_required:
+        if core_present >= min_core_joints:
             valid_frames += 1
 
-    valid_ratio = valid_frames / total_frames
+    ratio = valid_frames / total_frames
+    if ratio < min_valid_ratio:
+        return False, f"INSUFFICIENT_COVERAGE_{int(ratio*100)}%"
 
-    if valid_ratio >= min_valid_ratio:
-        return True, "OK"
-    elif valid_ratio >= 0.2:  # Some visibility but not enough
-        return False, "PARTIAL_BODY_ONLY"
-    else:
-        return False, "NO_VALID_BODY"
+    return True, "OK"
 
 
-def check_motion_improved(
+def check_motion(
     keypoints: np.ndarray,
-    movement_threshold: float = 0.1,
-    activity_type: Optional[str] = None
+    movement_threshold: float = 0.02,
+    variance_threshold: float = 5.0
 ) -> Tuple[bool, str]:
     """
-    Improved motion detection that understands different activity types.
+    Check if there is sufficient motion OR pose variation in the clip.
+
+    Two types of valid motion:
+    1. Continuous movement (person moving)
+    2. Pose variation (person holding different poses)
+
+    Args:
+        keypoints: (T, 17, 2) array of 2D keypoints
+        movement_threshold: Minimum average movement to be considered motion
+        variance_threshold: Minimum pose variance to be considered variation
+
+    Returns:
+        (has_motion_or_variation, reason_if_not)
     """
     if keypoints.shape[0] < 2:
-        return False, "TOO_FEW_FRAMES"
+        return False, "TOO_SHORT_FOR_MOTION_CHECK"
 
-    # Activity-specific thresholds
-    if activity_type in LOW_MOTION_ACTIVITIES or activity_type in EXERCISE_ACTIVITIES:
-        # For stationary exercises, check for ANY movement (even small)
-        movement_threshold = 0.02  # Very low threshold
-    elif activity_type in HAND_ONLY_ACTIVITIES:
-        # For hand activities, focus on wrist movement
-        movement_threshold = 0.05
-    elif activity_type in DYNAMIC_ACTIVITIES:
-        # For dynamic activities, expect more movement
-        movement_threshold = 0.15
-    else:
-        # Default threshold
-        movement_threshold = 0.1
-
-    # Calculate movement
+    # Calculate frame-to-frame movement
     total_movement = 0
     valid_comparisons = 0
-
-    # For stationary activities, also check for pose variation (different poses held)
-    pose_variations = []
+    pose_configurations = []
 
     for t in range(keypoints.shape[0] - 1):
         curr_kpts = keypoints[t]
@@ -153,73 +99,67 @@ def check_motion_improved(
         # Calculate movement for valid joints
         movement = np.sqrt(np.sum((next_kpts[valid_mask] - curr_kpts[valid_mask])**2, axis=1))
 
-        # Normalize by image size (approximate)
-        normalized_movement = np.mean(movement) / 100  # Rough normalization
+        # Normalize by rough image size
+        normalized_movement = np.mean(movement) / 100
         total_movement += normalized_movement
         valid_comparisons += 1
 
         # Store pose configuration for variation check
-        if activity_type in LOW_MOTION_ACTIVITIES:
-            pose_config = curr_kpts[valid_mask].flatten()
-            pose_variations.append(pose_config)
+        pose_config = curr_kpts[valid_mask].flatten()
+        pose_configurations.append(pose_config)
 
     if valid_comparisons == 0:
         return False, "NO_VALID_COMPARISONS"
 
+    # Check average movement
     avg_movement = total_movement / valid_comparisons
-    has_variation = False
 
-    # For low-motion activities, also check for pose variation
-    if activity_type in LOW_MOTION_ACTIVITIES and len(pose_variations) > 1:
-        # Check if poses are different (person changing position/pose)
-        # Ensure all variations have the same shape
-        min_len = min(len(p) for p in pose_variations) if pose_variations else 0
+    # Check pose variation (are poses different even if not moving much?)
+    has_variation = False
+    if len(pose_configurations) > 1:
+        # Align all pose configs to same length
+        min_len = min(len(p) for p in pose_configurations)
         if min_len > 0:
             try:
-                pose_variations_aligned = [p[:min_len] for p in pose_variations]
-                # Convert to numpy array for std calculation
-                pose_array = np.array(pose_variations_aligned)
+                aligned_configs = [p[:min_len] for p in pose_configurations]
+                pose_array = np.array(aligned_configs)
                 if pose_array.ndim >= 2:
+                    # Calculate standard deviation across time
                     pose_std = np.std(pose_array, axis=0)
-                    has_variation = np.mean(pose_std) > 5  # Some variation in poses
-                else:
-                    has_variation = False
-            except (ValueError, np.VisibleDeprecationWarning):
-                # If shapes are incompatible, skip variation check
+                    has_variation = np.mean(pose_std) > variance_threshold
+            except:
                 has_variation = False
-        else:
-            has_variation = False
 
-        if has_variation or avg_movement > movement_threshold:
-            return True, "OK"
-
-    # Standard motion check
-    if avg_movement > movement_threshold:
+    # Valid if either moving OR changing poses
+    if avg_movement > movement_threshold or has_variation:
         return True, "OK"
     else:
-        # Only mark as NO_MOTION if it's not an expected low-motion activity
-        if activity_type in LOW_MOTION_ACTIVITIES or activity_type in EXERCISE_ACTIVITIES:
-            return True, "OK"  # These activities are expected to have low motion
         return False, "NO_MOTION"
 
 
-def check_tracking_consistency_improved(
+def check_tracking_consistency(
     keypoints: np.ndarray,
     bboxes: np.ndarray,
     max_jump_ratio: float = 2.0,
-    activity_type: Optional[str] = None
+    max_iou_breaks: float = 0.1
 ) -> Tuple[bool, str]:
     """
-    Improved tracking that better handles intentional subject switches.
+    Check if tracking is consistent throughout the clip.
+
+    Args:
+        keypoints: (T, 17, 2) array of 2D keypoints
+        bboxes: (T, 4) array of bounding boxes
+        max_jump_ratio: Maximum allowed ratio of bbox size for frame-to-frame jumps
+        max_iou_breaks: Maximum ratio of frames with poor IoU overlap
+
+    Returns:
+        (is_consistent, reason_if_not)
     """
     if keypoints.shape[0] < 2:
         return True, "OK"
 
-    jumps = 0
+    iou_breaks = 0
     valid_transitions = 0
-
-    # Track if there's consistent presence of a main subject
-    main_subject_frames = 0
 
     for t in range(len(bboxes) - 1):
         bbox1 = bboxes[t]
@@ -234,113 +174,31 @@ def check_tracking_consistency_improved(
         # Calculate center distance
         center1 = [(bbox1[0] + bbox1[2])/2, (bbox1[1] + bbox1[3])/2]
         center2 = [(bbox2[0] + bbox2[2])/2, (bbox2[1] + bbox2[3])/2]
-        dist = np.sqrt((center2[0] - center1[0])**2 + (center2[1] - center1[1])**2)
 
-        # Size of bbox1 for normalization
-        bbox1_size = max(bbox1[2] - bbox1[0], bbox1[3] - bbox1[1])
+        # Calculate size change
+        size1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+        size2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
 
-        # Detect jumps
-        if dist > bbox1_size * max_jump_ratio and iou < 0.1:
-            jumps += 1
+        if size1 > 0 and size2 > 0:
+            size_ratio = max(size1/size2, size2/size1)
         else:
-            main_subject_frames += 1
+            size_ratio = max_jump_ratio + 1
 
         valid_transitions += 1
 
-    # More lenient for certain activities
-    if activity_type == 'playing_dominoes':
-        # This specific video is known to switch between people
-        max_jump_ratio_allowed = 0.5  # Allow more jumps
-    else:
-        max_jump_ratio_allowed = 0.2
+        # Check for tracking breaks
+        if iou < 0.1 and size_ratio > max_jump_ratio:
+            iou_breaks += 1
 
-    # Only fail if there are too many jumps AND no consistent main subject
-    if valid_transitions > 0:
-        jump_ratio = jumps / valid_transitions
-        main_subject_ratio = main_subject_frames / valid_transitions
+    if valid_transitions == 0:
+        return True, "OK"
 
-        # Fail only if excessive jumps AND no main subject
-        if jump_ratio > max_jump_ratio_allowed and main_subject_ratio < 0.5:
-            return False, "TRACKING_JUMPS"
+    break_ratio = iou_breaks / valid_transitions
+    if break_ratio > max_iou_breaks:
+        return False, f"TRACKING_BREAKS_{int(break_ratio*100)}%"
 
     return True, "OK"
 
-
-def check_tracking_consistency(bboxes: np.ndarray, keypoints: np.ndarray) -> Tuple[bool, str]:
-    """Check if tracking stayed on the same person throughout the video."""
-    valid_boxes = []
-    for i, box in enumerate(bboxes):
-        if not np.any(np.isnan(box)):
-            valid_boxes.append((i, box))
-
-    if len(valid_boxes) < 3:
-        return True, "TOO_FEW_FRAMES_FOR_TRACKING_CHECK"
-
-    # REASONABLE tracking switch detection - only flag real problems
-    suspicious_jumps = 0
-    switch_frames = []
-    max_normal_movement = 150  # Allow reasonable movement for activities
-
-    for i in range(1, len(valid_boxes)):
-        idx1, box1 = valid_boxes[i-1]
-        idx2, box2 = valid_boxes[i]
-
-        # Calculate movement
-        center1 = np.array([(box1[0] + box1[2])/2, (box1[1] + box1[3])/2])
-        center2 = np.array([(box2[0] + box2[2])/2, (box2[1] + box2[3])/2])
-        movement = np.linalg.norm(center2 - center1)
-
-        # Calculate size change
-        size1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        size2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        size_ratio = min(size1, size2) / (max(size1, size2) + 1e-6)
-
-        # Calculate IoU for continuity
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-
-        if x2 > x1 and y2 > y1:
-            intersection = (x2 - x1) * (y2 - y1)
-            area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-            area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-            iou = intersection / (area1 + area2 - intersection + 1e-6)
-        else:
-            iou = 0
-
-        # Frame gap
-        frame_gap = idx2 - idx1
-        movement_per_frame = movement / max(frame_gap, 1)
-
-        # ONLY flag CLEAR switches - be conservative
-        is_switch = False
-
-        # Clear person switch: NO overlap AND huge movement
-        if iou == 0 and movement_per_frame > 200:
-            is_switch = True
-        # Extreme movement even with some overlap (likely different person)
-        elif movement_per_frame > 300:
-            is_switch = True
-        # Very sudden vertical jump with no overlap (stage to audience etc)
-        elif iou == 0 and abs(center2[1] - center1[1]) > 200 and frame_gap <= 2:
-            is_switch = True
-        # Very sudden horizontal jump with no overlap
-        elif iou == 0 and abs(center2[0] - center1[0]) > 250 and frame_gap <= 2:
-            is_switch = True
-        # Dramatic size change with no overlap (different person)
-        elif iou == 0 and size_ratio < 0.3:
-            is_switch = True
-
-        if is_switch:
-            suspicious_jumps += 1
-            switch_frames.append(idx2)
-
-    # Only mark as problematic if there are multiple clear switches
-    if suspicious_jumps >= 2:
-        return False, f"TRACKING_SWITCHES_AT_FRAMES_{switch_frames[:3]}"
-
-    return True, "TRACKING_CONSISTENT"
 
 def validate_clip_improved(
     keypoints: np.ndarray,
@@ -348,13 +206,14 @@ def validate_clip_improved(
     bboxes: np.ndarray,
     video_path: Optional[str] = None,
     min_confidence: float = 0.3,
-    min_frames: int = 20,  # More lenient than 25
+    min_frames: int = 20,
     verbose: bool = False,
     has_hard_cuts: bool = False,
-    hard_cut_frames: Optional[List[int]] = None
+    hard_cut_frames: Optional[List[int]] = None,
+    tracking_switches: Optional[List[int]] = None
 ) -> Tuple[bool, List[str], str]:
     """
-    Improved validation that properly handles different activity types.
+    Validate clip based purely on pose quality and movement.
 
     Returns:
         (is_valid, list_of_issues, classification)
@@ -362,91 +221,88 @@ def validate_clip_improved(
     """
     issues = []
 
-    # Get activity type from path
-    activity_type = get_activity_type(video_path) if video_path else 'unknown'
-
     # Check for hard cuts (scene transitions)
     if has_hard_cuts:
         issues.append("HARD_CUTS_DETECTED")
-        # If there are hard cuts, mark as invalid
         if hard_cut_frames and len(hard_cut_frames) > 0:
-            issues.append(f"SCENE_TRANSITIONS_AT_FRAMES_{hard_cut_frames[:3]}")  # Show first 3
+            issues.append(f"SCENE_TRANSITIONS_AT_FRAMES_{hard_cut_frames[:3]}")
 
-    # Check tracking consistency - critical for multi-person scenes
-    tracking_consistent, tracking_msg = check_tracking_consistency(bboxes, keypoints)
-    if not tracking_consistent:
-        issues.append(tracking_msg)
+    # Check tracking consistency
+    if tracking_switches and len(tracking_switches) > max(5, len(bboxes) * 0.05):
+        issues.append(f"EXCESSIVE_TRACKING_SWITCHES_{len(tracking_switches)}_FRAMES")
+    else:
+        tracking_consistent, tracking_msg = check_tracking_consistency(keypoints, bboxes)
+        if not tracking_consistent:
+            issues.append(tracking_msg)
 
-    # Check minimum frames (more lenient)
+    # Check minimum frames
     if keypoints.shape[0] < min_frames:
         issues.append(f"TOO_SHORT_{keypoints.shape[0]}_frames")
 
-    # Check body coverage with activity awareness
-    has_coverage, reason = check_minimum_body_coverage_improved(
-        keypoints, scores, min_confidence, activity_type
+    # Check body coverage
+    has_coverage, reason = check_minimum_body_coverage(
+        keypoints, scores, min_confidence
     )
     if not has_coverage:
         issues.append(reason)
 
-    # Check motion with activity awareness
-    has_motion, reason = check_motion_improved(
-        keypoints, activity_type=activity_type
-    )
-    if not has_motion and reason == "NO_MOTION":
-        # Only add NO_MOTION if it's not expected for this activity
-        if activity_type not in LOW_MOTION_ACTIVITIES and activity_type not in EXERCISE_ACTIVITIES:
-            issues.append(reason)
-
-    # Check tracking consistency with activity awareness
-    is_consistent, reason = check_tracking_consistency_improved(
-        keypoints, bboxes, activity_type=activity_type
-    )
-    if not is_consistent:
+    # Check motion/variation
+    has_motion, reason = check_motion(keypoints)
+    if not has_motion:
         issues.append(reason)
 
-    # Determine classification based on issues
+    # Determine classification
     if len(issues) == 0:
         return True, issues, "VALID"
 
-    # Check for critical issues that make it INVALID
-    critical_issues = {"NO_KEYPOINTS", "NO_VALID_BODY", "NO_DETECTION",
-                      "TOO_SHORT_8_frames", "TOO_SHORT_13_frames"}  # Very short videos
+    # Critical issues that make it INVALID
+    critical_issues = {
+        "NO_KEYPOINTS", "NO_VALID_BODY", "NO_DETECTION",
+        "TOO_SHORT_FOR_MOTION_CHECK", "NO_VALID_COMPARISONS"
+    }
 
-    has_critical = any(issue in critical_issues or issue.startswith("TOO_SHORT_") and
-                       int(issue.split('_')[2]) < 15 for issue in issues)
+    # Check for critical issues
+    has_critical = any(
+        issue in critical_issues or
+        (issue.startswith("TOO_SHORT_") and int(issue.split('_')[2]) < 15)
+        for issue in issues
+    )
 
     if has_critical:
         return False, issues, "INVALID"
 
-    # Check if it's PARTIAL (has some issues but still usable)
-    partial_issues = {"PARTIAL_BODY_ONLY", "NO_MOTION", "LOW_DENSITY"}
-    has_partial = any(issue in partial_issues for issue in issues)
+    # Check for issues that make it PARTIAL
+    partial_triggers = {"NO_MOTION", "HARD_CUTS_DETECTED", "EXCESSIVE_TRACKING_SWITCHES"}
+    has_partial_trigger = any(
+        any(trigger in issue for trigger in partial_triggers)
+        for issue in issues
+    )
 
-    # Special handling for specific videos mentioned by user
-    if video_path:
-        video_name = video_path.split('/')[-1]
-        # These should be VALID according to user
-        should_be_valid = [
-            'hr1C96buU4E',  # playing_dominoes (even with tracking jump)
-            'JLB6AiX5BqE',  # tapping_pen (hand only is OK)
-            '_GRX1r0JV30',  # zumba
-            '1CTY_T7ncz8',  # yoga
-            'Rbqed-3vGHo',  # tai chi
-            '6KzAkh5JFmY',  # spinning poi
-            'E6Wce29gyC4',  # spinning plates
-            '7Gbdvr23dw4',  # mountain climber exercise
-        ]
+    if has_partial_trigger:
+        return False, issues, "PARTIAL"
 
-        for video_id in should_be_valid:
-            if video_id in video_name:
-                # Override to VALID for these specific videos
-                return True, [], "VALID"
-
-    if has_partial and not has_critical:
-        # Be more lenient - if it has minor issues, still mark as VALID
-        if len(issues) <= 2 and activity_type in (LOW_MOTION_ACTIVITIES | EXERCISE_ACTIVITIES | DYNAMIC_ACTIVITIES):
-            return True, [], "VALID"
-        return True, issues, "PARTIAL"
-
-    # Default to INVALID if multiple serious issues
+    # Default to INVALID for other issues
     return False, issues, "INVALID"
+
+
+# Keep the old function for compatibility
+def validate_clip(
+    keypoints: np.ndarray,
+    scores: np.ndarray = None,
+    min_confidence: float = 0.3,
+    min_frames: int = 25,
+    verbose: bool = False
+) -> Tuple[bool, List[str]]:
+    """Legacy validation function for backward compatibility."""
+    if scores is None:
+        scores = np.ones((keypoints.shape[0], 17))
+
+    # Create dummy bboxes
+    bboxes = np.zeros((keypoints.shape[0], 4))
+
+    is_valid, issues, _ = validate_clip_improved(
+        keypoints, scores, bboxes, None,
+        min_confidence, min_frames, verbose
+    )
+
+    return is_valid, issues

@@ -98,6 +98,7 @@ def get_validation_status(npz_data: dict, video_path: str = None) -> Tuple[str, 
         bboxes = npz_data.get('bboxes', np.full((keypoints.shape[0], 4), np.nan))
         has_hard_cuts = bool(npz_data.get('has_hard_cuts', [False])[0]) if 'has_hard_cuts' in npz_data else False
         hard_cut_frames = list(npz_data.get('hard_cut_frames', [])) if 'hard_cut_frames' in npz_data else []
+        tracking_switches = list(npz_data.get('tracking_switches', [])) if 'tracking_switches' in npz_data else []
 
         is_valid, issues, classification = validate_clip_improved(
             keypoints, scores, bboxes,
@@ -106,7 +107,8 @@ def get_validation_status(npz_data: dict, video_path: str = None) -> Tuple[str, 
             min_frames=20,  # More lenient
             verbose=False,
             has_hard_cuts=has_hard_cuts,
-            hard_cut_frames=hard_cut_frames
+            hard_cut_frames=hard_cut_frames,
+            tracking_switches=tracking_switches
         )
         return classification, issues
     else:
@@ -368,7 +370,7 @@ def process_video_worker(
 
     # Import here to avoid loading models in main process
     from data_prep.pipeline.pipeline import process_video
-    from data_prep.video_action_description import VideoActionDescriber
+    from data_prep.video_action_description import FastVideoActionDescriber as VideoActionDescriber
     from torchvision import models
     from transformers import AutoImageProcessor, VitPoseForPoseEstimation
 
@@ -444,7 +446,7 @@ def process_video_worker(
                         vitpose_model=vitpose_model,
                         action_describer=action_describer,
                         enable_action_description=enable_vlm,
-                        debug=False  # Don't create debug in pipeline
+                        debug=create_debug  # Enable debug mode in pipeline if debug videos requested
                     )
 
                     if result and 'npz' in result:
@@ -468,15 +470,17 @@ def process_video_worker(
                         new_npz_path = npz_dir / f"{new_name}.npz"
                         shutil.move(str(npz_path), str(new_npz_path))
 
-                        # Create debug video if requested
+                        # Use debug video from pipeline if it was created
                         debug_created = False
-                        if create_debug:
-                            debug_path = video_dir / f"{new_name}.mp4"
-                            debug_created = create_debug_video(
-                                video_path, new_npz_path, debug_path, max_frames
-                            )
-                            if debug_created:
-                                logger.info(f"Worker {worker_id}: Created debug video: {debug_path.name}")
+                        debug_path = None
+                        if create_debug and 'debug' in result and result['debug']:
+                            # Pipeline created a debug video - copy it to our output dir
+                            pipeline_debug_path = Path(result['debug'])
+                            if pipeline_debug_path.exists():
+                                debug_path = video_dir / f"{new_name}.mp4"
+                                shutil.copy2(pipeline_debug_path, debug_path)
+                                debug_created = True
+                                logger.info(f"Worker {worker_id}: Using pipeline debug video: {debug_path.name}")
 
                         # Save description
                         desc_created = False
@@ -496,7 +500,7 @@ def process_video_worker(
                             'density_ok': bool(data['density_ok'][0]) if 'density_ok' in data else False,
                             'dynamic_ok': bool(data['dynamic_ok'][0]) if 'dynamic_ok' in data else False,
                             'npz_path': str(new_npz_path),
-                            'debug_video': str(debug_path) if debug_created else None,
+                            'debug_video': str(debug_path) if debug_path and debug_created else None,
                             'description': str(desc_path) if desc_created else None,
                             'processing_time': time.time() - start_time,
                             'worker_id': worker_id
