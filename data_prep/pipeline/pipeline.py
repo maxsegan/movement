@@ -1,5 +1,7 @@
 from pathlib import Path
 from typing import Dict, Optional
+import time
+import logging
 
 import cv2
 import numpy as np
@@ -7,11 +9,14 @@ import torch
 
 from data_prep.keypoints import h36m_coco_format
 from data_prep.vitpose import infer_sequence
-from data_prep.pipeline.sampling import probe_video_meta, read_frames_by_indices, sample_indices_for_fps
+# Use fast video loader for improved performance
+from data_prep.fast_video_loader import probe_video_meta_fast, read_frames_batch_fast, sample_indices_for_fps
 from data_prep.pose3d import load_motionagformer_from_path, lift_sequence_to_3d
 from data_prep import clip_filtering as filt
 from data_prep.video_action_description import FastVideoActionDescriber as VideoActionDescriber, ActionDescription
 from data_prep.bytetrack import ByteTracker, Track
+
+logger = logging.getLogger(__name__)
 
 
 def detect_hard_cuts(frames, threshold=0.4):
@@ -56,24 +61,34 @@ def process_video(
     # VLM for action description
     action_describer: Optional[VideoActionDescriber] = None,
     enable_action_description: bool = False,
+    # Tracking optimization
+    detection_height: int = 480,  # Downsample to this height for detection
 ) -> Dict[str, str]:
-    meta = probe_video_meta(video_path)
+    t_start = time.time()
+    timings = {}
+
+    t0 = time.time()
+    meta = probe_video_meta_fast(video_path)
     idxs = sample_indices_for_fps(meta["frames"], meta["fps"], target_fps=target_fps)
-    frames = read_frames_by_indices(video_path, idxs)
+    frames = read_frames_batch_fast(video_path, idxs, target_fps=target_fps)
+    # Ensure frames are in RGB format (ffmpeg returns RGB, OpenCV returns BGR)
+    timings['video_load'] = time.time() - t0
 
     # For debug mode, we need ALL frames for proper visualization
     all_frames = None
     if debug:
         all_frame_indices = np.arange(meta["frames"])
-        all_frames = read_frames_by_indices(video_path, all_frame_indices)
+        all_frames = read_frames_batch_fast(video_path, all_frame_indices)
 
     # ViTPose path using existing module (requires precomputed boxes per frame)
     # Detect hard cuts first (using sampled frames is fine for this)
+    t0 = time.time()
     hard_cuts = detect_hard_cuts(frames)
     has_hard_cuts = len(hard_cuts) > 0
+    timings['hard_cut_detection'] = time.time() - t0
 
-    # Run tracking on ALL frames if in debug mode, otherwise just sampled frames
-    frames_to_track = all_frames if (debug and all_frames is not None) else frames
+    # Always track on sampled frames only for smart batch tracking
+    frames_to_track = frames
 
     boxes_xyxy = np.full((frames.shape[0], 4), np.nan, dtype=np.float32)
     boxes_xyxy_all_frames = None  # For debug visualization
@@ -93,99 +108,38 @@ def process_video(
     main_track_id = None
     tracking_switches = []
 
+    t0 = time.time()  # Start timing for detection/tracking
     if det_2d_model is not None:
         if debug and all_frames is not None:
             # In debug mode: track ALL frames for smooth visualization
             boxes_xyxy_all_frames = np.full((all_frames.shape[0], 4), np.nan, dtype=np.float32)
 
-        with torch.no_grad():
-            for i in range(frames_to_track.shape[0]):
-                img = to_tensor(frames_to_track[i]).to(device)
-                out = det_2d_model([img])[0]
+        # Use smart batch tracking with 480p downscaling
+        from data_prep.smart_batch_tracking import smart_batch_track
+        from torchvision.transforms.functional import to_tensor
 
-                # Reset tracker at hard cuts
-                if i in hard_cuts:
-                    tracker = ByteTracker(
-                        track_thresh=0.5,
-                        track_buffer=30,
-                        match_thresh=0.3,  # Lower IoU threshold
-                        min_box_area=100
-                    )
-                    main_track_id = None
+        # Smart tracking: detect on sampled frames with 480p downscaling
+        boxes_xyxy, all_tracks_per_frame, tracking_stats = smart_batch_track(
+            det_model=det_2d_model,
+            frames=frames_to_track,
+            device=device,
+            to_tensor_fn=to_tensor,
+            detection_batch_size=32,
+            track_thresh=0.5,
+            match_thresh=0.3,
+            min_box_area=100,
+            hard_cuts=hard_cuts if has_hard_cuts else [],
+            downscale_detection=True,  # Enable 480p downscaling
+            detection_height=detection_height,  # Use parameter value (default 480)
+        )
 
-                # Get all person detections
-                person_boxes = []
-                person_scores = []
+    timings['detection_tracking'] = time.time() - t0
 
-                if out["boxes"].numel() > 0:
-                    labels = out["labels"].detach().cpu().numpy()
-                    scores = out["scores"].detach().cpu().numpy()
-                    boxes = out["boxes"].detach().cpu().numpy()
-
-                    # Filter for persons only (class 1 in COCO) with higher confidence
-                    mask = (labels == 1) & (scores >= 0.5)  # Increased from 0.3 to avoid false positives
-                    idx = np.flatnonzero(mask)
-
-                    if idx.size > 0:
-                        person_boxes = boxes[idx]
-                        person_scores = scores[idx]
-                    else:
-                        person_boxes = np.empty((0, 4))
-                        person_scores = np.empty(0)
-                else:
-                    person_boxes = np.empty((0, 4))
-                    person_scores = np.empty(0)
-
-                # Update tracker with all detections
-                active_tracks = tracker.update(person_boxes, person_scores)
-                all_tracks_per_frame.append(active_tracks)
-
-                # Select main track to follow
-                if active_tracks:
-                    # First frame with tracks: pick the best one
-                    if main_track_id is None:
-                        main_track = tracker.get_main_track()
-                        if main_track:
-                            main_track_id = main_track.track_id
-                            if debug and all_frames is not None:
-                                boxes_xyxy_all_frames[i] = main_track.bbox.astype(np.float32)
-                            # Map to sampled frame if needed
-                            if i in idxs:
-                                sampled_idx = np.where(idxs == i)[0][0]
-                                boxes_xyxy[sampled_idx] = main_track.bbox.astype(np.float32)
-                    else:
-                        # Subsequent frames: stick with the same track ID
-                        main_track = None
-                        for track in active_tracks:
-                            if track.track_id == main_track_id:
-                                main_track = track
-                                break
-
-                        if main_track:
-                            # Found our tracked person
-                            if debug and all_frames is not None:
-                                boxes_xyxy_all_frames[i] = main_track.bbox.astype(np.float32)
-                            # Map to sampled frame if needed
-                            if i in idxs:
-                                sampled_idx = np.where(idxs == i)[0][0]
-                                boxes_xyxy[sampled_idx] = main_track.bbox.astype(np.float32)
-                        else:
-                            # Lost our main track - pick a new one
-                            main_track = tracker.get_main_track()
-                            if main_track:
-                                # Only count as a switch if we had to pick a different person
-                                tracking_switches.append(i)
-                                main_track_id = main_track.track_id
-                                if debug and all_frames is not None:
-                                    boxes_xyxy_all_frames[i] = main_track.bbox.astype(np.float32)
-                                # Map to sampled frame if needed
-                                if i in idxs:
-                                    sampled_idx = np.where(idxs == i)[0][0]
-                                    boxes_xyxy[sampled_idx] = main_track.bbox.astype(np.float32)
-
+    t0 = time.time()
     if vitpose_processor is None or vitpose_model is None:
         raise RuntimeError("ViTPose processor/model must be provided to process_video")
 
+    # Pass pre-loaded frames to avoid re-reading from disk
     kpts, scrs = infer_sequence(
         raw_video_path=video_path,
         image_processor=vitpose_processor,
@@ -193,7 +147,12 @@ def process_video(
         device=torch.device(device),
         idxs=idxs,
         boxes_xyxy=boxes_xyxy,
+        frames=frames,  # Use already-loaded frames
+        batch_size=16,  # Batch processing for GPU efficiency
     )
+    timings['pose_2d'] = time.time() - t0
+    
+    t0 = time.time()
     # Store tracking data for debug visualization
     tracking_data = {
         'all_tracks_per_frame': all_tracks_per_frame if 'all_tracks_per_frame' in locals() else [],
@@ -238,6 +197,12 @@ def process_video(
             y3d = lift_sequence_to_3d(seq_k[None, ...], seq_s[None, ...], meta["width"], meta["height"], model_3d, device)
         except Exception as e:
             y3d = None
+            timings['pose_3d'] = 0.0
+    
+    if 'pose_3d' not in timings:
+        timings['pose_3d'] = time.time() - t0
+    
+    t0 = time.time()
 
     # Generate action descriptions if enabled
     action_descriptions = []
@@ -262,6 +227,9 @@ def process_video(
                 })
         except Exception as e:
             print(f"Error generating action descriptions: {e}")
+    
+    timings['vlm'] = time.time() - t0
+    t0 = time.time()
 
     # Save outputs
     vp = Path(video_path)
@@ -399,7 +367,22 @@ def process_video(
 
             writer.write(img)
         writer.release()
+    
+    timings['debug_video'] = time.time() - t0
 
+    timings['total'] = time.time() - t_start
+    
+    # Log detailed timing breakdown
+    import sys
+    timing_msg = (f"Pipeline timing - Load: {timings.get('video_load', 0):.1f}s, " +
+                f"Det/Track: {timings.get('detection_tracking', 0):.1f}s, " +
+                f"Pose2D: {timings.get('pose_2d', 0):.1f}s, " +
+                f"Pose3D: {timings.get('pose_3d', 0):.1f}s, " +
+                f"VLM: {timings.get('vlm', 0):.1f}s, " +
+                f"Debug: {timings.get('debug_video', 0):.1f}s, " +
+                f"Total: {timings['total']:.1f}s")
+    print(timing_msg, file=sys.stderr, flush=True)
+    
     return {"npz": str(npz_path), "debug": str(debug_path) if debug_path else ""}
 
 

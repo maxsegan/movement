@@ -14,9 +14,21 @@ def infer_sequence(
     device,
     idxs,
     boxes_xyxy,
+    frames: np.ndarray = None,
+    batch_size: int = 16,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Run ViTPose across specific frame indices using per-frame person boxes.
+
+    Args:
+        raw_video_path: Path to video (used only if frames is None)
+        image_processor: ViTPose image processor
+        model: ViTPose model
+        device: torch device
+        idxs: Frame indices to process
+        boxes_xyxy: Bounding boxes per frame
+        frames: Optional pre-loaded frames (RGB format). If provided, avoids re-reading video.
+        batch_size: Batch size for inference (default 16)
 
     Returns:
         all_keypoints: (1, T, 17, 2)
@@ -26,14 +38,25 @@ def infer_sequence(
     all_keypoints = np.zeros((1, T, 17, 2), dtype=np.float32)
     all_scores = np.zeros((1, T, 17), dtype=np.float32)
 
-    cap = cv2.VideoCapture(raw_video_path)
-    for t, frame_no in enumerate(idxs):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_no))
-        ok, frame_bgr = cap.read()
-        if not ok:
-            continue
+    # Prepare all crops and metadata first
+    crops_to_process = []
+    crop_metadata = []  # Store (t, x1_buffered, y1_buffered, person_boxes_coco)
 
-        rgb_frame = frame_bgr[:, :, ::-1]
+    cap = None
+    if frames is None:
+        cap = cv2.VideoCapture(raw_video_path)
+
+    for t, frame_no in enumerate(idxs):
+        # Get frame
+        if frames is not None:
+            rgb_frame = frames[t]
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_no))
+            ok, frame_bgr = cap.read()
+            if not ok:
+                continue
+            rgb_frame = frame_bgr[:, :, ::-1]
+
         bbox_xyxy = np.array(boxes_xyxy[t], dtype=np.float32)
 
         # Skip frames with invalid bounding boxes
@@ -75,28 +98,55 @@ def infer_sequence(
             axis=0,
         )
 
-        image = PIL.Image.fromarray(cropped_frame)
-        pixel_values = image_processor(image, boxes=[person_boxes_coco], return_tensors="pt").pixel_values
-        dataset_index = torch.tensor([0], device=device)
+        crops_to_process.append(cropped_frame)
+        crop_metadata.append((t, x1_buffered, y1_buffered, person_boxes_coco))
 
-        pixel_values = pixel_values.to(device=device)
-        with torch.no_grad():
-            outputs = model(pixel_values, dataset_index=dataset_index)
-        pose_results = image_processor.post_process_pose_estimation(outputs, boxes=[person_boxes_coco])
-        image_pose_result = pose_results[0][0]
+    if cap is not None:
+        cap.release()
 
-        # Get keypoints relative to cropped image
-        keypoints_crop = image_pose_result["keypoints"].cpu().numpy()
+    # Process crops in batches
+    with torch.no_grad():
+        for batch_start in range(0, len(crops_to_process), batch_size):
+            batch_end = min(batch_start + batch_size, len(crops_to_process))
+            batch_crops = crops_to_process[batch_start:batch_end]
+            batch_meta = crop_metadata[batch_start:batch_end]
 
-        # Transform keypoints back to original image coordinates
-        keypoints_orig = keypoints_crop.copy()
-        keypoints_orig[:, 0] += x1_buffered  # Add back x offset
-        keypoints_orig[:, 1] += y1_buffered  # Add back y offset
+            # Prepare batch inputs
+            batch_pixel_values = []
+            batch_boxes = []
 
-        all_keypoints[0, t] = keypoints_orig
-        all_scores[0, t] = image_pose_result["scores"].cpu().numpy()
+            for crop, (t, x1_buf, y1_buf, boxes_coco) in zip(batch_crops, batch_meta):
+                image = PIL.Image.fromarray(crop)
+                pixel_values = image_processor(image, boxes=[boxes_coco], return_tensors="pt").pixel_values
+                batch_pixel_values.append(pixel_values)
+                batch_boxes.append(boxes_coco)
 
-    cap.release()
+            # Stack into single batch tensor
+            batch_tensor = torch.cat(batch_pixel_values, dim=0).to(device=device)
+            dataset_indices = torch.zeros(batch_tensor.shape[0], dtype=torch.long, device=device)
+
+            # Run batched inference
+            outputs = model(batch_tensor, dataset_index=dataset_indices)
+
+            # Post-process entire batch at once
+            all_boxes = [meta[3] for meta in batch_meta]
+            pose_results = image_processor.post_process_pose_estimation(outputs, boxes=all_boxes)
+
+            # Extract results for each frame
+            for i, (t, x1_buffered, y1_buffered, boxes_coco) in enumerate(batch_meta):
+                image_pose_result = pose_results[i][0]
+
+                # Get keypoints relative to cropped image
+                keypoints_crop = image_pose_result["keypoints"].cpu().numpy()
+
+                # Transform keypoints back to original image coordinates
+                keypoints_orig = keypoints_crop.copy()
+                keypoints_orig[:, 0] += x1_buffered  # Add back x offset
+                keypoints_orig[:, 1] += y1_buffered  # Add back y offset
+
+                all_keypoints[0, t] = keypoints_orig
+                all_scores[0, t] = image_pose_result["scores"].cpu().numpy()
+
     return all_keypoints, all_scores
 
 

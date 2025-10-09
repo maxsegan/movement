@@ -42,7 +42,7 @@ def parse_args_fast():
     parser.add_argument('--enable_vlm', action='store_true', default=True,
                         help='Enable VLM action descriptions (default: True)')
     parser.add_argument('--vlm_model', type=str,
-                        default='microsoft/Phi-3.5-vision-instruct')
+                        default='Qwen/Qwen2.5-VL-3B-Instruct')
 
     # Other settings
     parser.add_argument('--debug', action='store_true',

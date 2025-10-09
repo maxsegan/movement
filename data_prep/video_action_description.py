@@ -15,7 +15,7 @@ import cv2
 from typing import List, Dict, Optional, Tuple, Union
 from pathlib import Path
 from transformers import (
-    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
     AutoProcessor,
     BitsAndBytesConfig
 )
@@ -40,16 +40,16 @@ class FastVideoActionDescriber:
     """
 
     # Optimization configurations
-    MAX_RESOLUTION = 224  # Lower resolution for faster processing
-    MAX_FRAMES = 4  # Fewer frames for faster inference
+    MAX_RESOLUTION = 480  # Higher resolution for better VLM quality
+    MAX_FRAMES_VLM = 8  # More frames for better temporal understanding
     BATCH_SIZE = 4  # Process multiple videos at once
 
     def __init__(
         self,
         device: str = "cuda:0",
-        model_name: str = "microsoft/Phi-3.5-vision-instruct",
-        use_quantization: bool = True,
-        use_flash_attention: bool = True,
+        model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct",
+        use_quantization: bool = False,
+        use_flash_attention: bool = False,
         cache_dir: Optional[str] = None
     ):
         """
@@ -91,7 +91,7 @@ class FastVideoActionDescriber:
                 )
 
             # Load model with optimizations
-            self.model = AutoModelForCausalLM.from_pretrained(
+            self.model = AutoModelForImageTextToText.from_pretrained(
                 self.model_name,
                 quantization_config=quantization_config,
                 torch_dtype=torch.bfloat16 if not use_quantization else None,
@@ -122,14 +122,14 @@ class FastVideoActionDescriber:
         self,
         frames: List[np.ndarray],
         bboxes: Optional[List[np.ndarray]] = None,
-        target_size: int = 224
+        target_size: int = 480
     ) -> List[Image.Image]:
         """
-        Preprocess frames with aggressive optimization.
+        Preprocess frames with bounding box visualization.
 
         Args:
             frames: List of video frames
-            bboxes: Optional person bounding boxes for cropping
+            bboxes: Optional person bounding boxes for drawing
             target_size: Target resolution
 
         Returns:
@@ -138,19 +138,14 @@ class FastVideoActionDescriber:
         processed = []
 
         for i, frame in enumerate(frames):
-            # Crop to person if bbox available
+            # Draw bounding box on frame if available (don't crop, just annotate)
             if bboxes and i < len(bboxes):
                 bbox = bboxes[i]
                 if not np.any(np.isnan(bbox)):
                     x1, y1, x2, y2 = bbox.astype(int)
-                    # Add padding
-                    h, w = frame.shape[:2]
-                    pad = int(0.1 * min(x2-x1, y2-y1))
-                    x1 = max(0, x1 - pad)
-                    y1 = max(0, y1 - pad)
-                    x2 = min(w, x2 + pad)
-                    y2 = min(h, y2 + pad)
-                    frame = frame[y1:y2, x1:x2]
+                    frame = frame.copy()
+                    # Draw thick red box to clearly mark the person
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), thickness=4)  # Red in RGB
 
             # Resize to target resolution
             if frame.shape[0] > target_size or frame.shape[1] > target_size:
@@ -238,7 +233,7 @@ class FastVideoActionDescriber:
                 # Fast sampling
                 sample_indices = self.sample_frames_fast(
                     min(total_frames, len(all_indices[batch_start + i])),
-                    self.MAX_FRAMES
+                    self.MAX_FRAMES_VLM
                 )
 
                 frames = []
@@ -306,14 +301,15 @@ class FastVideoActionDescriber:
         with torch.no_grad():
             for images, prompt in zip(batch_images, batch_prompts):
                 try:
-                    # Create input
-                    messages = [
-                        {"role": "user", "content": prompt}
-                    ]
-
-                    # Add images to content
+                    # Create input with images for Qwen2.5-VL
+                    content = []
                     for img in images:
-                        messages[0]["content"] = [img] + [messages[0]["content"]]
+                        content.append({"type": "image", "image": img})
+                    content.append({"type": "text", "text": prompt})
+
+                    messages = [
+                        {"role": "user", "content": content}
+                    ]
 
                     # Process with model
                     text = self.processor.apply_chat_template(
@@ -326,16 +322,13 @@ class FastVideoActionDescriber:
                         text=text,
                         images=images,
                         return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=512  # Limit context length
+                        padding=True
                     ).to(self.device)
 
                     # Generate with constraints
                     outputs = self.model.generate(
                         **inputs,
-                        max_new_tokens=50,  # Short descriptions only
-                        temperature=0.7,
+                        max_new_tokens=256,  # Allow detailed descriptions, stops early on EOS
                         do_sample=False,  # Greedy for speed
                         num_beams=1  # No beam search for speed
                     )
@@ -352,17 +345,20 @@ class FastVideoActionDescriber:
                     else:
                         description = response.strip()
 
-                    results.append(description[:200])  # Limit length
+                    self.logger.info(f"VLM generated description ({len(description)} chars): {description[:100]}...")
+                    results.append(description)  # Return full description
 
                 except Exception as e:
                     self.logger.error(f"Single inference failed: {e}")
+                    import traceback
+                    self.logger.error(traceback.format_exc())
                     results.append("")
 
         return results
 
     def get_fast_prompt(self) -> str:
-        """Get optimized prompt for fast inference."""
-        return "Describe the person's action in 10 words or less:"
+        """Get optimized prompt for fast inference with directive instructions."""
+        return """Describe the actions of the person featured in the box prescriptively in at most a few clear and concise sentences such that somebody could recreate their motion closely based on the description. For example, "Carefully stack the four plates, lifting them one by one starting with the plate on the right" or "Powerfully swing the hammer down on the large tire repeatedly with a wide athletic stance"."""
 
     def process_video_fast(
         self,
@@ -379,6 +375,34 @@ class FastVideoActionDescriber:
             keypoints: 2D keypoints
             bboxes: Bounding boxes
             indices: Frame indices
+
+        Returns:
+            List with single action description
+        """
+        return self.generate_description_batch(
+            [video_path], [keypoints], [bboxes], [indices]
+        )
+
+    def process_video_with_tracking(
+        self,
+        video_path: str,
+        keypoints: np.ndarray,
+        bboxes: np.ndarray,
+        indices: np.ndarray,
+        segment_duration: float = 5.0,
+        fps: float = 10.0
+    ) -> List[ActionDescription]:
+        """
+        Process video with tracking data (compatible interface).
+        Ignores segment_duration and fps parameters - processes entire video.
+
+        Args:
+            video_path: Path to video
+            keypoints: 2D keypoints
+            bboxes: Bounding boxes
+            indices: Frame indices
+            segment_duration: Ignored (for compatibility)
+            fps: Ignored (for compatibility)
 
         Returns:
             List with single action description

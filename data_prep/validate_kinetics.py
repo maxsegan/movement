@@ -292,7 +292,7 @@ def save_description(npz_path: Path, output_path: Path) -> bool:
                 f.write(f"Frames: {meta[1]:.0f} @ {meta[0]:.1f} FPS\n\n")
 
             # Validation status
-            status, reasons = get_validation_status(data, str(video_path))
+            status, reasons = get_validation_status(data, npz_path.stem)
             f.write(f"Validation Status: {status}\n")
             if reasons:
                 f.write(f"Issues: {', '.join(reasons)}\n")
@@ -354,7 +354,8 @@ def process_video_worker(
     target_fps: float,
     enable_vlm: bool,
     create_debug: bool,
-    max_frames: int
+    max_frames: int,
+    detector: str = 'fasterrcnn'
 ):
     """
     Worker process that runs on a specific GPU.
@@ -371,17 +372,32 @@ def process_video_worker(
     # Import here to avoid loading models in main process
     from data_prep.pipeline.pipeline import process_video
     from data_prep.video_action_description import FastVideoActionDescriber as VideoActionDescriber
-    from torchvision import models
     from transformers import AutoImageProcessor, VitPoseForPoseEstimation
 
     try:
         # Load models for this worker
         logger.info(f"Worker {worker_id}: Loading models...")
 
-        # Detection model
-        det_model = models.detection.fasterrcnn_resnet50_fpn(weights='DEFAULT')
-        det_model.to(device)
-        det_model.eval()
+        # Detection model - selectable via --detector flag
+        if detector == 'fasterrcnn':
+            logger.info("Using Faster R-CNN detector (stable, slow)")
+            from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
+            weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
+            det_model = fasterrcnn_resnet50_fpn_v2(weights=weights, box_score_thresh=0.5)
+            det_model.to(device)
+            det_model.eval()
+        elif detector == 'rtmdet':
+            logger.info("Using RTMDet detector (fast, accurate)")
+            try:
+                from mmdet.apis import init_detector
+                config = 'rtmdet_m_8xb32-300e_coco.py'
+                checkpoint = 'https://download.openmmlab.com/mmdetection/v3.0/rtmdet/rtmdet_m_8xb32-300e_coco/rtmdet_m_8xb32-300e_coco_20220719_112220-229f527c.pth'
+                det_model = init_detector(config, checkpoint, device=device)
+            except ImportError:
+                logger.error("RTMDet requires mmdetection. Install with: pip install mmdet mmcv")
+                raise
+        else:
+            raise ValueError(f"Unknown detector: {detector}")
 
         # ViTPose model - use float32 for stability
         vitpose_model_id = "usyd-community/vitpose-plus-large"
@@ -436,6 +452,7 @@ def process_video_worker(
 
                 try:
                     # Process video
+                    t_process_start = time.time()
                     result = process_video(
                         str(video_path),
                         npz_dir,
@@ -446,8 +463,10 @@ def process_video_worker(
                         vitpose_model=vitpose_model,
                         action_describer=action_describer,
                         enable_action_description=enable_vlm,
-                        debug=create_debug  # Enable debug mode in pipeline if debug videos requested
+                        debug=create_debug,  # Enable debug mode in pipeline if debug videos requested
+                        detection_height=480,  # Use 480p for faster detection
                     )
+                    t_process = time.time() - t_process_start
 
                     if result and 'npz' in result:
                         # Load NPZ data for validation
@@ -484,11 +503,17 @@ def process_video_worker(
 
                         # Save description
                         desc_created = False
+                        t_desc_start = time.time()
                         if enable_vlm:
                             desc_path = desc_dir / f"{new_name}.txt"
                             desc_created = save_description(new_npz_path, desc_path)
                             if desc_created:
                                 logger.info(f"Worker {worker_id}: Saved description: {desc_path.name}")
+                        t_desc = time.time() - t_desc_start
+
+                        t_total = time.time() - start_time
+                        t_postprocess = t_total - t_process
+                        logger.info(f"Worker {worker_id}: Timing - Process: {t_process:.1f}s, Postprocess: {t_postprocess:.1f}s (desc: {t_desc:.2f}s), Total: {t_total:.1f}s")
 
                         # Create result
                         result_data = {
@@ -502,7 +527,7 @@ def process_video_worker(
                             'npz_path': str(new_npz_path),
                             'debug_video': str(debug_path) if debug_path and debug_created else None,
                             'description': str(desc_path) if desc_created else None,
-                            'processing_time': time.time() - start_time,
+                            'processing_time': t_total,
                             'worker_id': worker_id
                         }
 
@@ -718,6 +743,9 @@ def main():
                         help='Maximum frames per debug video')
     parser.add_argument('--skip_debug_videos', action='store_true',
                         help='Skip generating debug videos')
+    parser.add_argument('--detector', type=str, default='fasterrcnn',
+                        choices=['fasterrcnn', 'rtmdet'],
+                        help='Person detection model to use (fasterrcnn=stable/slow, rtmdet=fast/accurate)')
 
     args = parser.parse_args()
 
@@ -764,7 +792,8 @@ def main():
             p = Process(target=process_video_worker, args=(
                 worker_id, gpu_id, video_queue, result_queue,
                 output_dir, args.target_fps, args.enable_vlm,
-                not args.skip_debug_videos, args.max_frames
+                not args.skip_debug_videos, args.max_frames,
+                args.detector
             ))
             p.start()
             workers.append(p)

@@ -83,7 +83,11 @@ def run_tracking_and_save(
     Create detector, run IoU-based tracking, and save tracking JSON to path.
     Returns frame indices and boxes.
     """
-    model_det = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT").to(device).eval()
+    from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
+    weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
+    model_det = fasterrcnn_resnet50_fpn_v2(weights=weights, box_score_thresh=0.5)
+    model_det.to(device)
+    model_det.eval()
     base_tf = T.ToTensor()
     def tf(img):
         return base_tf(img).to(device)
