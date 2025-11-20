@@ -63,6 +63,7 @@ def process_video(
     enable_action_description: bool = False,
     # Tracking optimization
     detection_height: int = 480,  # Downsample to this height for detection
+    verbose: bool = False,  # Whether to print detailed processing stats
 ) -> Dict[str, str]:
     t_start = time.time()
     timings = {}
@@ -131,6 +132,7 @@ def process_video(
             hard_cuts=hard_cuts if has_hard_cuts else [],
             downscale_detection=True,  # Enable 480p downscaling
             detection_height=detection_height,  # Use parameter value (default 480)
+            verbose=verbose,  # Pass verbose flag
         )
 
     timings['detection_tracking'] = time.time() - t0

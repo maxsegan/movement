@@ -6,3 +6,10 @@ MotionAGFormer/
 __pycache__/
 *.pyc
 CLAUDE.md
+
+# YOLO model files (too large for git)
+yolov8x.pt
+yolov8x.onnx
+yolov8x.engine
+*.engine
+*.onnx

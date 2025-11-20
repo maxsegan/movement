@@ -122,7 +122,7 @@ def create_debug_video(
     output_path: Path,
     max_frames: int = 150
 ) -> bool:
-    """Create debug video with skeleton overlay."""
+    """Create debug video with bounding box overlay (no skeleton)."""
     try:
         # Load pose data
         data = np.load(npz_path, allow_pickle=True)
@@ -130,10 +130,8 @@ def create_debug_video(
         if 'keypoints2d' not in data:
             return False
 
-        keypoints = data['keypoints2d']
-        scores = data.get('scores2d', np.ones_like(keypoints[..., 0]))
-        indices = data.get('indices', np.arange(keypoints.shape[0]))
-        bboxes = data.get('bboxes', np.full((keypoints.shape[0], 4), np.nan))
+        indices = data.get('indices', np.arange(data['keypoints2d'].shape[0]))
+        bboxes = data.get('bboxes', np.full((data['keypoints2d'].shape[0], 4), np.nan))
 
         # Open video
         cap = cv2.VideoCapture(str(video_path))
@@ -156,16 +154,7 @@ def create_debug_video(
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(str(output_path), fourcc, min(fps / 3, 10), (target_width, target_height))
 
-        # H36M skeleton connections
-        skeleton = [
-            [0, 1], [1, 2], [2, 3],  # Right leg
-            [0, 4], [4, 5], [5, 6],  # Left leg
-            [0, 7], [7, 8], [8, 9], [9, 10],  # Spine to head
-            [8, 11], [11, 12], [12, 13],  # Right arm
-            [8, 14], [14, 15], [15, 16],  # Left arm
-        ]
-
-        # Calculate scaling factor for keypoints
+        # Calculate scaling factor
         scale_x = target_width / orig_width
         scale_y = target_height / orig_height
 
@@ -191,51 +180,42 @@ def create_debug_video(
                         x1, y1, x2, y2 = bboxes[pose_idx]
                         x1, y1, x2, y2 = int(x1*scale_x), int(y1*scale_y), int(x2*scale_x), int(y2*scale_y)
 
-                        # Draw main tracking box (solid green)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(frame, "Tracked", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
-                                   0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                        # Draw main tracking box (solid green, thicker)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
 
-                        # Draw buffered box used for pose detection (dashed blue)
-                        buffer_ratio = 0.2
-                        width = x2 - x1
-                        height = y2 - y1
-                        buffer_x = int(width * buffer_ratio)
-                        buffer_y = int(height * buffer_ratio)
+                        # Add label with frame number
+                        label = f"Person (Frame {frame_idx})"
+                        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
 
-                        x1_buf = max(0, x1 - buffer_x)
-                        y1_buf = max(0, y1 - buffer_y)
-                        x2_buf = min(target_width, x2 + buffer_x)
-                        y2_buf = min(target_height, y2 + buffer_y)
+                        # Draw label background
+                        cv2.rectangle(frame,
+                                    (x1, y1 - label_size[1] - 10),
+                                    (x1 + label_size[0] + 10, y1),
+                                    (0, 255, 0), -1)
 
-                        # Draw buffered box with dashed line effect
-                        cv2.rectangle(frame, (x1_buf, y1_buf), (x2_buf, y2_buf), (255, 200, 0), 1)
-                        cv2.putText(frame, "Detection Area", (x1_buf, y1_buf-5), cv2.FONT_HERSHEY_SIMPLEX,
-                                   0.4, (255, 200, 0), 1, cv2.LINE_AA)
+                        # Draw label text
+                        cv2.putText(frame, label, (x1 + 5, y1 - 5),
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2, cv2.LINE_AA)
 
-                    # Draw skeleton (scale keypoints)
-                    kpts = keypoints[pose_idx].copy()
-                    kpts[:, 0] *= scale_x
-                    kpts[:, 1] *= scale_y
-                    scrs = scores[pose_idx]
+                        # Add corner markers for emphasis
+                        corner_length = 20
+                        corner_thickness = 3
 
-                    # Color based on score
-                    for j, (x, y) in enumerate(kpts):
-                        if x > 0 and y > 0:
-                            color = (0, 255, 0) if scrs[j] > 0.5 else (0, 255, 255) if scrs[j] > 0.3 else (0, 0, 255)
-                            cv2.circle(frame, (int(x), int(y)), 3, color, -1)
-                            cv2.circle(frame, (int(x), int(y)), 4, (255, 255, 255), 1)
+                        # Top-left corner
+                        cv2.line(frame, (x1, y1), (x1 + corner_length, y1), (0, 255, 255), corner_thickness)
+                        cv2.line(frame, (x1, y1), (x1, y1 + corner_length), (0, 255, 255), corner_thickness)
 
-                    # Draw bones
-                    for connection in skeleton:
-                        if len(connection) == 2:
-                            j1, j2 = connection
-                            if j1 < len(kpts) and j2 < len(kpts):
-                                if (scrs[j1] > 0.3 and scrs[j2] > 0.3 and
-                                    kpts[j1][0] > 0 and kpts[j2][0] > 0):
-                                    pt1 = (int(kpts[j1][0]), int(kpts[j1][1]))
-                                    pt2 = (int(kpts[j2][0]), int(kpts[j2][1]))
-                                    cv2.line(frame, pt1, pt2, (0, 255, 255), 2)
+                        # Top-right corner
+                        cv2.line(frame, (x2, y1), (x2 - corner_length, y1), (0, 255, 255), corner_thickness)
+                        cv2.line(frame, (x2, y1), (x2, y1 + corner_length), (0, 255, 255), corner_thickness)
+
+                        # Bottom-left corner
+                        cv2.line(frame, (x1, y2), (x1 + corner_length, y2), (0, 255, 255), corner_thickness)
+                        cv2.line(frame, (x1, y2), (x1, y2 - corner_length), (0, 255, 255), corner_thickness)
+
+                        # Bottom-right corner
+                        cv2.line(frame, (x2, y2), (x2 - corner_length, y2), (0, 255, 255), corner_thickness)
+                        cv2.line(frame, (x2, y2), (x2, y2 - corner_length), (0, 255, 255), corner_thickness)
 
                     processed += 1
 
@@ -354,8 +334,7 @@ def process_video_worker(
     target_fps: float,
     enable_vlm: bool,
     create_debug: bool,
-    max_frames: int,
-    detector: str = 'fasterrcnn'
+    max_frames: int
 ):
     """
     Worker process that runs on a specific GPU.
@@ -373,31 +352,20 @@ def process_video_worker(
     from data_prep.pipeline.pipeline import process_video
     from data_prep.video_action_description import FastVideoActionDescriber as VideoActionDescriber
     from transformers import AutoImageProcessor, VitPoseForPoseEstimation
+    from data_prep.pose3d import build_motionagformer
+
+    # Add MotionAGFormer to path and import
+    sys.path.append(str(Path(__file__).parent.parent / 'MotionAGFormer'))
+    from model.MotionAGFormer import MotionAGFormer
 
     try:
         # Load models for this worker
         logger.info(f"Worker {worker_id}: Loading models...")
 
-        # Detection model - selectable via --detector flag
-        if detector == 'fasterrcnn':
-            logger.info("Using Faster R-CNN detector (stable, slow)")
-            from torchvision.models.detection import fasterrcnn_resnet50_fpn_v2, FasterRCNN_ResNet50_FPN_V2_Weights
-            weights = FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT
-            det_model = fasterrcnn_resnet50_fpn_v2(weights=weights, box_score_thresh=0.5)
-            det_model.to(device)
-            det_model.eval()
-        elif detector == 'rtmdet':
-            logger.info("Using RTMDet detector (fast, accurate)")
-            try:
-                from mmdet.apis import init_detector
-                config = 'rtmdet_m_8xb32-300e_coco.py'
-                checkpoint = 'https://download.openmmlab.com/mmdetection/v3.0/rtmdet/rtmdet_m_8xb32-300e_coco/rtmdet_m_8xb32-300e_coco_20220719_112220-229f527c.pth'
-                det_model = init_detector(config, checkpoint, device=device)
-            except ImportError:
-                logger.error("RTMDet requires mmdetection. Install with: pip install mmdet mmcv")
-                raise
-        else:
-            raise ValueError(f"Unknown detector: {detector}")
+        # Detection model - YOLOv8x with batch processing support
+        logger.info("Loading YOLOv8x with batch processing support")
+        from data_prep.yolo_batch_detector import load_yolo_batch_detector
+        det_model = load_yolo_batch_detector('yolov8x', device=device)
 
         # ViTPose model - use float32 for stability
         vitpose_model_id = "usyd-community/vitpose-plus-large"
@@ -418,10 +386,60 @@ def process_video_worker(
         # Enable mixed precision training for speed (autocast will handle it)
         torch.backends.cudnn.benchmark = True
 
-        # VLM if enabled
-        action_describer = None
+        # MotionAGFormer for 3D pose lifting
+        logger.info("Loading MotionAGFormer for 3D pose lifting...")
+        ckpt_path = Path('/root/movement/models/motionagformer-b-h36m.pth.tr')
+        if ckpt_path.exists():
+            model_3d = build_motionagformer(MotionAGFormer, device, ckpt_path)
+            logger.info("MotionAGFormer loaded successfully")
+        else:
+            logger.warning(f"MotionAGFormer checkpoint not found at {ckpt_path}, 3D lifting disabled")
+            model_3d = None
+
+        # Multiple VLMs if enabled
+        vlm_models = {}
         if enable_vlm:
-            action_describer = VideoActionDescriber(device=device)
+            logger.info("Loading Qwen3-VL-32B model for video description...")
+
+            # Model configuration - using only Qwen3-VL-32B based on comparison results
+            vlm_configs = [
+                {
+                    "name": "qwen3vl-32b",
+                    "model_id": "Qwen/Qwen3-VL-32B-Instruct",
+                    "use_4bit": True,
+                },
+            ]
+
+            # Load each model
+            for config in vlm_configs:
+                try:
+                    logger.info(f"Loading {config['name']}...")
+                    from data_prep.multi_vlm_loader import load_vlm_model
+                    model, processor = load_vlm_model(config, device=device)
+                    if model is not None:
+                        vlm_models[config['name']] = {
+                            'model': model,
+                            'processor': processor,
+                            'config': config
+                        }
+                        logger.info(f"Successfully loaded {config['name']}")
+                    else:
+                        logger.error(f"Model loading returned None for {config['name']}")
+                except Exception as e:
+                    logger.error(f"Failed to load {config['name']}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+            logger.info(f"Loaded {len(vlm_models)} VLM models successfully: {list(vlm_models.keys())}")
+
+            if len(vlm_models) == 0:
+                logger.error("No VLM models loaded successfully! Falling back to default.")
+                # Fallback to single VLM
+                action_describer = VideoActionDescriber(device=device)
+        else:
+            # VLM disabled
+            vlm_models = {}
+            action_describer = None
 
         logger.info(f"Worker {worker_id}: Models loaded successfully")
 
@@ -451,7 +469,7 @@ def process_video_worker(
                 logger.info(f"Worker {worker_id}: Processing {action_class}/{video_name}")
 
                 try:
-                    # Process video
+                    # Process video (disable VLM in pipeline, we'll do it separately)
                     t_process_start = time.time()
                     result = process_video(
                         str(video_path),
@@ -461,10 +479,12 @@ def process_video_worker(
                         det_2d_model=det_model,
                         vitpose_processor=vitpose_processor,
                         vitpose_model=vitpose_model,
-                        action_describer=action_describer,
-                        enable_action_description=enable_vlm,
-                        debug=create_debug,  # Enable debug mode in pipeline if debug videos requested
+                        action_describer=None,  # Disable VLM in pipeline
+                        enable_action_description=False,  # We'll do VLM separately
+                        debug=False,  # We'll create our own debug video
                         detection_height=480,  # Use 480p for faster detection
+                        model3d="MotionAGFormer.model.MotionAGFormer:MotionAGFormer" if model_3d else None,
+                        ckpt3d=str(ckpt_path) if model_3d else None
                     )
                     t_process = time.time() - t_process_start
 
@@ -489,27 +509,96 @@ def process_video_worker(
                         new_npz_path = npz_dir / f"{new_name}.npz"
                         shutil.move(str(npz_path), str(new_npz_path))
 
-                        # Use debug video from pipeline if it was created
+                        # Generate descriptions with all VLMs
+                        all_descriptions = {}
+                        t_desc_start = time.time()
+
+                        if enable_vlm and len(vlm_models) > 0:
+                            logger.info(f"Worker {worker_id}: Generating descriptions with {len(vlm_models)} models: {list(vlm_models.keys())}")
+
+                            # Extract frames for VLM processing
+                            import cv2
+                            from PIL import Image
+
+                            cap = cv2.VideoCapture(str(video_path))
+                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                            # Sample 8 frames uniformly
+                            max_frames = 8
+                            if total_frames <= max_frames:
+                                frame_indices = list(range(total_frames))
+                            else:
+                                frame_indices = np.linspace(0, total_frames - 1, max_frames, dtype=int).tolist()
+
+                            frames = []
+                            for idx in frame_indices:
+                                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                                ret, frame = cap.read()
+                                if ret:
+                                    # Convert BGR to RGB and to PIL
+                                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                    # Resize to 448x448 for most models
+                                    frame = cv2.resize(frame, (448, 448))
+                                    frames.append(Image.fromarray(frame))
+                            cap.release()
+
+                            # Generate with each model
+                            for model_name, model_data in vlm_models.items():
+                                try:
+                                    from data_prep.multi_vlm_loader import generate_description_with_model
+
+                                    # Use the optimized prompt from video_action_description.py
+                                    prompt = """Rewrite only the physical motion as a sequence of imperative commands. Do not mention a person, actor, bounding box, body type, clothing, scene, environment, animals, spectators, or camera. Mention only objects that the action physically interacts with. Do not narrate, summarize, or describe anything. Use only imperative verbs. Start immediately with a command. Include fine-grained movement details (body position, limb use, sequence of steps). The output must be a concise instruction that someone could follow to reproduce the motion precisely." Format requirement: 1–3 short sentences, each in pure imperative form. Examples of desired output: "Slide into a split, roll forward across the floor, and push up into a low crouch.", "Position the metal sheet under the press brake, lower the tooling in one smooth motion, then lift the bent piece and place it aside.","Kneel beside the tree, lift the ornament with your right hand, and hook it onto the mid-level branch while stabilizing the tree with your left.", "Raise the object overhead, step forward, and swing it downward in a controlled arc."""
+
+                                    description = generate_description_with_model(
+                                        model_name,
+                                        model_data['model'],
+                                        model_data['processor'],
+                                        frames,
+                                        prompt
+                                    )
+
+                                    all_descriptions[model_name] = description
+
+                                    # Save individual description file
+                                    model_desc_path = desc_dir / f"{new_name}_{model_name}.txt"
+                                    with open(model_desc_path, 'w') as f:
+                                        f.write(f"Video: {video_name}\n")
+                                        f.write(f"Action Class: {action_class}\n")
+                                        f.write(f"Model: {model_name}\n")
+                                        f.write(f"Description:\n{description}\n")
+
+                                    logger.info(f"Worker {worker_id}: {model_name}: {description[:80]}...")
+
+                                except Exception as e:
+                                    logger.error(f"Worker {worker_id}: Error with {model_name}: {e}")
+                                    all_descriptions[model_name] = f"Error: {str(e)}"
+
+                            # Save combined description file
+                            desc_path = desc_dir / f"{new_name}_all.txt"
+                            with open(desc_path, 'w') as f:
+                                f.write(f"Video: {video_name}\n")
+                                f.write(f"Action Class: {action_class}\n")
+                                f.write("="*60 + "\n")
+                                for model_name, description in all_descriptions.items():
+                                    f.write(f"\n[{model_name}]:\n{description}\n")
+                                    f.write("-"*40 + "\n")
+
+                            desc_created = True
+                        else:
+                            desc_created = False
+                            desc_path = None
+
+                        t_desc = time.time() - t_desc_start
+
+                        # Create debug video with bounding boxes only
                         debug_created = False
                         debug_path = None
-                        if create_debug and 'debug' in result and result['debug']:
-                            # Pipeline created a debug video - copy it to our output dir
-                            pipeline_debug_path = Path(result['debug'])
-                            if pipeline_debug_path.exists():
-                                debug_path = video_dir / f"{new_name}.mp4"
-                                shutil.copy2(pipeline_debug_path, debug_path)
-                                debug_created = True
-                                logger.info(f"Worker {worker_id}: Using pipeline debug video: {debug_path.name}")
-
-                        # Save description
-                        desc_created = False
-                        t_desc_start = time.time()
-                        if enable_vlm:
-                            desc_path = desc_dir / f"{new_name}.txt"
-                            desc_created = save_description(new_npz_path, desc_path)
-                            if desc_created:
-                                logger.info(f"Worker {worker_id}: Saved description: {desc_path.name}")
-                        t_desc = time.time() - t_desc_start
+                        if create_debug:
+                            debug_path = video_dir / f"{new_name}.mp4"
+                            debug_created = create_debug_video(video_path, new_npz_path, debug_path, max_frames)
+                            if debug_created:
+                                logger.info(f"Worker {worker_id}: Created debug video: {debug_path.name}")
 
                         t_total = time.time() - start_time
                         t_postprocess = t_total - t_process
@@ -698,7 +787,7 @@ def save_results(results, output_dir, valid_count, invalid_count, partial_count,
                 f.write(f"| {issue} | {count} | {count/total*100:.1f}% |\n")
 
         f.write(f"\n## Files\n\n")
-        f.write(f"- **Debug Videos:** `debug_videos/` - Visual overlays showing skeleton tracking\n")
+        f.write(f"- **Debug Videos:** `debug_videos/` - Visual overlays showing bounding box tracking\n")
         f.write(f"- **Descriptions:** `descriptions/` - Text files with VLM analysis and validation details\n")
         f.write(f"- **NPZ Files:** `npz_files/` - Raw pose data\n")
         f.write(f"- **Full Report:** `validation_report.json` - Detailed JSON results\n\n")
@@ -715,7 +804,7 @@ def save_results(results, output_dir, valid_count, invalid_count, partial_count,
         f.write(f"## How to Review\n\n")
         f.write(f"1. Check `debug_videos/` for visual validation of pose tracking\n")
         f.write(f"2. Files are named: `[STATUS]_[ACTION]_[VIDEO]_[ISSUES].mp4`\n")
-        f.write(f"3. Green skeletons = high confidence, Yellow = medium, Red = low\n")
+        f.write(f"3. Green bounding boxes indicate tracked persons in the video\n")
         f.write(f"4. Review `descriptions/` for VLM analysis and validation details\n")
 
 
@@ -743,9 +832,6 @@ def main():
                         help='Maximum frames per debug video')
     parser.add_argument('--skip_debug_videos', action='store_true',
                         help='Skip generating debug videos')
-    parser.add_argument('--detector', type=str, default='fasterrcnn',
-                        choices=['fasterrcnn', 'rtmdet'],
-                        help='Person detection model to use (fasterrcnn=stable/slow, rtmdet=fast/accurate)')
 
     args = parser.parse_args()
 
@@ -792,8 +878,7 @@ def main():
             p = Process(target=process_video_worker, args=(
                 worker_id, gpu_id, video_queue, result_queue,
                 output_dir, args.target_fps, args.enable_vlm,
-                not args.skip_debug_videos, args.max_frames,
-                args.detector
+                not args.skip_debug_videos, args.max_frames
             ))
             p.start()
             workers.append(p)

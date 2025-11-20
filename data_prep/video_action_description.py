@@ -358,7 +358,7 @@ class FastVideoActionDescriber:
 
     def get_fast_prompt(self) -> str:
         """Get optimized prompt for fast inference with directive instructions."""
-        return """Describe the actions of the person featured in the box prescriptively in at most a few clear and concise sentences such that somebody could recreate their motion closely based on the description. For example, "Carefully stack the four plates, lifting them one by one starting with the plate on the right" or "Powerfully swing the hammer down on the large tire repeatedly with a wide athletic stance"."""
+        return """Rewrite only the physical motion as a sequence of imperative commands. Do not mention a person, actor, bounding box, body type, clothing, scene, environment, animals, spectators, or camera. Mention only objects that the action physically interacts with. Do not narrate, summarize, or describe anything. Use only imperative verbs. Start immediately with a command. Include fine-grained movement details (body position, limb use, sequence of steps). The output must be a concise instruction that someone could follow to reproduce the motion precisely.” Format requirement: 1–3 short sentences, each in pure imperative form. Examples of desired output: “Slide into a split, roll forward across the floor, and push up into a low crouch.”, “Position the metal sheet under the press brake, lower the tooling in one smooth motion, then lift the bent piece and place it aside.”,“Kneel beside the tree, lift the ornament with your right hand, and hook it onto the mid-level branch while stabilizing the tree with your left.”, “Raise the object overhead, step forward, and swing it downward in a controlled arc.””"""
 
     def process_video_fast(
         self,

@@ -24,6 +24,7 @@ def smart_batch_track(
     hard_cuts: Optional[List[int]] = None,
     downscale_detection: bool = False,  # Keep default as False for compatibility
     detection_height: int = 480,  # Target height when downscaling
+    verbose: bool = False,  # Whether to print detailed statistics
 ) -> Tuple[np.ndarray, List[Track], Dict]:
     """
     Smart tracking that detects on every sampled frame (no interpolation needed).
@@ -73,13 +74,15 @@ def smart_batch_track(
         hard_cuts = []
     hard_cuts_set = set(hard_cuts)
 
-    # Initialize tracker
+    # Initialize tracker with optimized YOLO parameters
     tracker = ByteTracker(
-        track_thresh=track_thresh,
-        track_buffer=30,
-        match_thresh=match_thresh,
+        track_thresh=0.4,  # Lower threshold to keep more tracks
+        track_buffer=60,   # Keep lost tracks longer (2 seconds at 30fps)
+        match_thresh=0.7,  # Higher IoU requirement for matching
         min_box_area=min_box_area
     )
+    # Use lower detection threshold for YOLO's accurate detections
+    detection_score_thresh = 0.3
     main_track_id = None
 
     # Prepare frames for detection (optionally downscale)
@@ -120,7 +123,8 @@ def smart_batch_track(
     t_postprocess_total = 0.0
 
     num_batches = (num_frames + detection_batch_size - 1) // detection_batch_size
-    print(f"  Processing {num_frames} frames in {num_batches} batches of up to {detection_batch_size}")
+    if verbose:
+        print(f"  Processing {num_frames} frames in {num_batches} batches of up to {detection_batch_size}")
 
     with torch.no_grad():
         for batch_num, batch_start in enumerate(range(0, num_frames, detection_batch_size)):
@@ -142,7 +146,7 @@ def smart_batch_track(
             t_inference_total += batch_inference_time
 
             # Log if batch is slow
-            if batch_inference_time > 5.0:
+            if verbose and batch_inference_time > 5.0:
                 print(f"  WARNING: Batch {batch_num+1}/{num_batches} took {batch_inference_time:.2f}s for {actual_batch_size} frames!")
 
             # Post-process results
@@ -160,7 +164,7 @@ def smart_batch_track(
                         boxes *= scale
 
                     # CRITICAL: Filter for persons only (class 1 in COCO) AND by score
-                    person_mask = (labels == 1) & (scores >= 0.5)
+                    person_mask = (labels == 1) & (scores >= detection_score_thresh)
                     if person_mask.any():
                         detection_results[frame_idx] = (
                             boxes[person_mask],
@@ -185,12 +189,12 @@ def smart_batch_track(
     t_tracking = time.time()
 
     for i in range(num_frames):
-        # Reset tracker at hard cuts
+        # Reset tracker at hard cuts with YOLO parameters
         if i in hard_cuts_set:
             tracker = ByteTracker(
-                track_thresh=track_thresh,
-                track_buffer=30,
-                match_thresh=match_thresh,
+                track_thresh=0.4,
+                track_buffer=60,
+                match_thresh=0.7,
                 min_box_area=min_box_area
             )
             main_track_id = None
@@ -233,25 +237,26 @@ def smart_batch_track(
     # Calculate total detection time
     total_detection_time = stats['prep_time'] + stats['inference_time'] + stats['postprocess_time']
 
-    # Print detailed statistics
-    print(f"\n=== Smart Batch Tracking Statistics ===")
-    print(f"Frames: {stats['num_frames']} | Batch size: {stats['batch_size']}")
-    print(f"Original resolution: {stats['original_resolution']}")
-    if stats['actual_downscale']:
-        print(f"Detection resolution: {stats['detection_resolution']} (downscaled from {stats['original_resolution']})")
-    else:
-        print(f"Detection resolution: {stats['detection_resolution']} (no downscaling)")
+    # Print detailed statistics only if verbose
+    if verbose:
+        print(f"\n=== Smart Batch Tracking Statistics ===")
+        print(f"Frames: {stats['num_frames']} | Batch size: {stats['batch_size']}")
+        print(f"Original resolution: {stats['original_resolution']}")
+        if stats['actual_downscale']:
+            print(f"Detection resolution: {stats['detection_resolution']} (downscaled from {stats['original_resolution']})")
+        else:
+            print(f"Detection resolution: {stats['detection_resolution']} (no downscaling)")
 
-    print(f"\nTiming breakdown:")
-    print(f"  Frame preparation: {stats['prep_time']:.3f}s")
-    if stats['actual_downscale']:
-        print(f"    (includes resizing {stats['num_frames']} frames to {stats['detection_resolution']})")
-    print(f"  Model inference: {stats['inference_time']:.3f}s")
-    print(f"    ({stats['num_frames']/stats['inference_time']:.1f} frames/sec)")
-    print(f"  Post-processing: {stats['postprocess_time']:.3f}s")
-    print(f"  Tracking (ByteTracker): {stats['tracking_time']:.3f}s")
-    print(f"  ──────────────────────")
-    print(f"  Total: {total_detection_time + stats['tracking_time']:.3f}s")
-    print(f"========================================\n")
+        print(f"\nTiming breakdown:")
+        print(f"  Frame preparation: {stats['prep_time']:.3f}s")
+        if stats['actual_downscale']:
+            print(f"    (includes resizing {stats['num_frames']} frames to {stats['detection_resolution']})")
+        print(f"  Model inference: {stats['inference_time']:.3f}s")
+        print(f"    ({stats['num_frames']/stats['inference_time']:.1f} frames/sec)")
+        print(f"  Post-processing: {stats['postprocess_time']:.3f}s")
+        print(f"  Tracking (ByteTracker): {stats['tracking_time']:.3f}s")
+        print(f"  ──────────────────────")
+        print(f"  Total: {total_detection_time + stats['tracking_time']:.3f}s")
+        print(f"========================================\n")
 
     return boxes_xyxy, all_tracks_per_frame, stats
