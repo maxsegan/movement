@@ -367,7 +367,7 @@ def main():
                         default='/root/movement/data/kinetics_processed',
                         help='Directory containing processed NPZ files')
     parser.add_argument('--video_dir', type=str,
-                        default='/data/kinetics-700',
+                        default='/root/movement/data/kinetics-dataset/k700-2020/train',
                         help='Directory containing original videos')
     parser.add_argument('--output_dir', type=str,
                         default='/root/movement/data/kinetics_full_output',
