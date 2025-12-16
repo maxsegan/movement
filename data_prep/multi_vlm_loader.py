@@ -67,7 +67,7 @@ def load_vlm_model(
                         model_id,
                         quantization_config=quantization_config,
                         torch_dtype=torch_dtype,
-                        device_map="auto",
+                        device_map=device if isinstance(device, str) else device,
                         trust_remote_code=True,
                         cache_dir=cache_dir
                     )
@@ -77,7 +77,7 @@ def load_vlm_model(
                         model_id,
                         quantization_config=quantization_config,
                         torch_dtype=torch_dtype,
-                        device_map="auto",
+                        device_map=device if isinstance(device, str) else device,
                         trust_remote_code=True,
                         cache_dir=cache_dir
                     )
@@ -88,7 +88,7 @@ def load_vlm_model(
                     model_id,
                     quantization_config=quantization_config,
                     torch_dtype=torch_dtype,
-                    device_map="auto",
+                    device_map=device if isinstance(device, str) else device,
                     trust_remote_code=True,
                     cache_dir=cache_dir
                 )
@@ -117,7 +117,7 @@ def load_vlm_model(
                 model_id,
                 quantization_config=quantization_config,
                 torch_dtype=torch_dtype,
-                device_map="auto",
+                device_map=device if isinstance(device, str) else device,
                 trust_remote_code=True,
                 cache_dir=cache_dir
             )
@@ -144,7 +144,7 @@ def load_vlm_model(
                 model_id,
                 quantization_config=quantization_config,
                 torch_dtype=torch_dtype,
-                device_map="auto",
+                device_map=device if isinstance(device, str) else device,
                 trust_remote_code=True,
                 cache_dir=cache_dir
             )

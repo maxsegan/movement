@@ -1,0 +1,53 @@
+dataset:
+  pose_dir: data/kinetics_processed
+  desc_dir: data/kinetics_full_output/descriptions
+  video_dir: data/kinetics-dataset/k700-2020  # Original videos (has train/val subdirs)
+  val_split: 0.02
+  max_samples_per_class: null
+  num_workers: 8
+  image_size: 224
+  normalize_pose: true
+  use_joint_angles: true  # Convert 3D positions to 22 joint angles
+  sample_stride: 3    # ~3.3Hz sampling from 10fps video -> ~30 samples per 10s clip
+  seed: 42
+
+model_config:
+  qwen_model_name: "Qwen/Qwen3-VL-4B-Instruct"
+  qwen_hidden_size: 2560
+  use_intermediate_hidden: true
+  hidden_layer_index: 18      # Middle layer (18/36) like GR00T - better spatial features
+  use_early_exit: true        # Skip layers 19-36 during inference for 2x speedup
+  use_deepstack_features: true
+  use_flash_attention: true
+  projection_dim: 512
+  action_dim: 22            # 22 joint angles (from 3D pose conversion)
+  diffusion_hidden_dim: 512
+  num_diffusion_layers: 8   # Increased from 4 (closer to GR00T's 12)
+  num_diffusion_heads: 8
+  num_future_tokens: 4      # Learnable future tokens for planning context (like GR00T)
+  action_horizon: 16
+  num_frames: 4
+  use_lora: true
+  lora_rank: 128
+  lora_alpha: 128
+  lora_dropout: 0.05
+  freeze_vision_encoder: true   # Frozen until 1%, then unfrozen
+  freeze_qwen_layers: 0         # LLM uses LoRA throughout
+  use_thinking_mode: false
+  diffusion_steps: 8
+
+learning_rate: 1.0e-5
+weight_decay: 0.01
+batch_size: 16  # Reduced further for post-unfreeze (vision encoder trainable uses more VRAM)
+num_epochs: 1                  # Single epoch with 24M+ samples
+unfreeze_pct: 0.05             # Unfreeze vision encoder at 5% (~4.7K steps) - more time for action head to stabilize
+gradient_accumulation_steps: 4  # Maintains effective batch size of 64 with batch_size=16
+gradient_clip: 1.0
+use_amp: true
+gradient_checkpointing: false  # Disabled for speed (use_reentrant=False was causing 3x slowdown)
+log_every_n_steps: 1
+save_every_n_steps: 750        # Checkpoint every 750 steps
+val_max_batches: 100           # Quick validation (100 batches = 400 samples)
+max_checkpoints: 5             # Keep only last N step checkpoints to save disk
+log_dir: logs/kinetics_vla
+checkpoint_dir: checkpoints/kinetics_vla

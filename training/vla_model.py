@@ -22,7 +22,8 @@ class VLAConfig:
     # Qwen3-VL backbone - using the latest version
     qwen_model_name: str = "Qwen/Qwen3-VL-2B-Instruct"
     use_intermediate_hidden: bool = True  # Extract intermediate layers
-    hidden_layer_index: int = -4  # Which layer to extract (-4 = 4th from last)
+    hidden_layer_index: int = 18  # Which layer to extract (18 = middle of 36 layers, like GR00T)
+    use_early_exit: bool = True  # Stop forward pass after hidden_layer_index for 2x speedup
     
     # Qwen3-VL specific settings
     qwen_hidden_size: int = 1536  # Qwen3-VL-2B hidden size
@@ -43,6 +44,7 @@ class VLAConfig:
     # Action chunking and horizon
     action_horizon: int = 8  # Predict 8 future actions at 30Hz
     action_chunking: bool = True
+    num_future_tokens: int = 4  # Learnable future tokens for planning context (like GR00T)
     
     # Frame processing (Qwen3-VL supports dynamic resolution)
     num_frames: int = 4  # Process 4 frames at 4Hz
@@ -78,11 +80,11 @@ class VLAConfig:
 
 class SinusoidalPosEmb(nn.Module):
     """Sinusoidal positional embeddings for diffusion timesteps"""
-    
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-    
+
     def forward(self, x):
         device = x.device
         half_dim = self.dim // 2
@@ -93,92 +95,208 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 
+class AdaLN(nn.Module):
+    """
+    Adaptive Layer Normalization (AdaLN) for timestep conditioning.
+    Modulates layer norm scale and shift based on conditioning input.
+    Used in DiT (Diffusion Transformer) architectures.
+    """
+
+    def __init__(self, hidden_dim: int, cond_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        # Project conditioning to scale and shift
+        self.cond_proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(cond_dim, hidden_dim * 2)
+        )
+        # Initialize to identity transform
+        nn.init.zeros_(self.cond_proj[-1].weight)
+        nn.init.zeros_(self.cond_proj[-1].bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor [B, L, D] or [B, D]
+            cond: Conditioning tensor [B, cond_dim]
+        Returns:
+            Normalized and modulated tensor
+        """
+        # Get scale and shift from conditioning
+        scale_shift = self.cond_proj(cond)  # [B, 2*D]
+        scale, shift = scale_shift.chunk(2, dim=-1)  # [B, D] each
+
+        # Normalize
+        x = self.norm(x)
+
+        # Apply modulation (broadcast over sequence dim if needed)
+        if x.dim() == 3:
+            scale = scale.unsqueeze(1)  # [B, 1, D]
+            shift = shift.unsqueeze(1)  # [B, 1, D]
+
+        return x * (1 + scale) + shift
+
+
+class DiTBlock(nn.Module):
+    """
+    Diffusion Transformer Block with AdaLN conditioning.
+    Interleaves self-attention over [state, actions] with cross-attention to VL features.
+    Following GR00T N1 architecture.
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # AdaLN for self-attention
+        self.norm1 = AdaLN(hidden_dim, hidden_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # AdaLN for cross-attention
+        self.norm2 = AdaLN(hidden_dim, hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # AdaLN for FFN
+        self.norm3 = AdaLN(hidden_dim, hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        vl_features: torch.Tensor,
+        t_emb: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: Sequence of [state_token, action_tokens] [B, 1+H, D]
+            vl_features: Vision-language features [B, L, D]
+            t_emb: Timestep embedding [B, D]
+        Returns:
+            Updated sequence [B, 1+H, D]
+        """
+        # Self-attention over state+action sequence with AdaLN
+        residual = x
+        x = self.norm1(x, t_emb)
+        x, _ = self.self_attn(x, x, x)
+        x = residual + x
+
+        # Cross-attention to VL features with AdaLN
+        residual = x
+        x = self.norm2(x, t_emb)
+        x, _ = self.cross_attn(x, vl_features, vl_features)
+        x = residual + x
+
+        # FFN with AdaLN
+        residual = x
+        x = self.norm3(x, t_emb)
+        x = self.ffn(x)
+        x = residual + x
+
+        return x
+
+
 class FlowMatchingDiffusion(nn.Module):
     """
-    Enhanced Flow Matching Diffusion Head optimized for Qwen3-VL features
-    Takes advantage of Qwen3's improved spatial and temporal understanding
+    Flow Matching Diffusion Head with DiT architecture.
+
+    Key improvements over previous version:
+    1. Per-timestep action encoding with positional embeddings
+    2. State token as separate token in the sequence
+    3. AdaLN for timestep conditioning throughout
+    4. DiT-style interleaved self-attention and cross-attention
+
+    Architecture follows GR00T N1: https://github.com/NVIDIA/Isaac-GR00T
     """
-    
+
     def __init__(self, config: VLAConfig):
         super().__init__()
         self.config = config
-        
-        # Time embedding with learnable components
+        hidden_dim = config.diffusion_hidden_dim
+
+        # Time embedding with MLP
         self.time_embed = nn.Sequential(
-            SinusoidalPosEmb(config.diffusion_hidden_dim),
-            nn.Linear(config.diffusion_hidden_dim, config.diffusion_hidden_dim * 2),
+            SinusoidalPosEmb(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 2),
             nn.SiLU(),
-            nn.Linear(config.diffusion_hidden_dim * 2, config.diffusion_hidden_dim),
+            nn.Linear(hidden_dim * 2, hidden_dim),
         )
-        
-        # Project from Qwen3 hidden states (with DeepStack features)
+
+        # Project from Qwen3 hidden states
         self.qwen_projection = nn.Sequential(
             nn.Linear(config.qwen_hidden_size, config.projection_dim),
             nn.LayerNorm(config.projection_dim),
             nn.SiLU(),
-            nn.Linear(config.projection_dim, config.diffusion_hidden_dim)
+            nn.Linear(config.projection_dim, hidden_dim)
         )
-        
-        # Optional: Project multi-level features if using DeepStack
+
+        # DeepStack features projection
         if config.use_deepstack_features:
             self.deepstack_projection = nn.Linear(
-                config.diffusion_hidden_dim * 2,  # Combine multiple levels
-                config.diffusion_hidden_dim
+                config.qwen_hidden_size * 2,
+                hidden_dim
             )
-        
-        # Action encoder/decoder with residual connections
+
+        # Per-timestep action encoder (NOT flattened!)
+        # Each action timestep is encoded separately
         self.action_encoder = nn.Sequential(
-            nn.Linear(config.action_dim * config.action_horizon, config.diffusion_hidden_dim),
-            nn.LayerNorm(config.diffusion_hidden_dim),
+            nn.Linear(config.action_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Dropout(config.diffusion_dropout)
         )
-        
-        # Proprioception encoder
-        self.proprio_encoder = nn.Sequential(
-            nn.Linear(config.action_dim, config.diffusion_hidden_dim // 2),
+
+        # Learnable positional embeddings for action horizon
+        self.action_pos_embed = nn.Parameter(
+            torch.randn(1, config.action_horizon, hidden_dim) * 0.02
+        )
+
+        # Proprioception/state encoder -> produces state TOKEN
+        self.state_encoder = nn.Sequential(
+            nn.Linear(config.action_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(config.diffusion_hidden_dim // 2, config.diffusion_hidden_dim),
-            nn.LayerNorm(config.diffusion_hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        
-        # Spatial-aware cross-attention (leveraging Qwen3's spatial understanding)
-        self.spatial_cross_attention = nn.MultiheadAttention(
-            embed_dim=config.diffusion_hidden_dim,
-            num_heads=config.num_diffusion_heads,
-            dropout=config.diffusion_dropout,
-            batch_first=True
-        )
-        
-        # Self-attention transformer layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.diffusion_hidden_dim,
-            nhead=config.num_diffusion_heads,
-            dim_feedforward=config.diffusion_hidden_dim * 4,
-            dropout=config.diffusion_dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True  # Pre-LN for stability
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=config.num_diffusion_layers
-        )
-        
-        # Final action prediction with skip connection
+
+        # Learnable future tokens for planning context (like GR00T)
+        # These provide additional learnable context between state and actions
+        self.num_future_tokens = config.num_future_tokens
+        if self.num_future_tokens > 0:
+            self.future_tokens = nn.Parameter(
+                torch.randn(1, config.num_future_tokens, hidden_dim) * 0.02
+            )
+
+        # DiT blocks with AdaLN
+        self.dit_blocks = nn.ModuleList([
+            DiTBlock(hidden_dim, config.num_diffusion_heads, config.diffusion_dropout)
+            for _ in range(config.num_diffusion_layers)
+        ])
+
+        # Final layer norm with AdaLN
+        self.final_norm = AdaLN(hidden_dim, hidden_dim)
+
+        # Per-timestep action decoder (NOT flattened!)
         self.action_decoder = nn.Sequential(
-            nn.Linear(config.diffusion_hidden_dim * 2, config.diffusion_hidden_dim * 2),
-            nn.LayerNorm(config.diffusion_hidden_dim * 2),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Dropout(config.diffusion_dropout),
-            nn.Linear(config.diffusion_hidden_dim * 2, config.action_dim * config.action_horizon),
+            nn.Linear(hidden_dim, config.action_dim),
         )
-        
-        # Learnable query tokens for action generation
-        self.action_queries = nn.Parameter(
-            torch.randn(1, config.action_horizon, config.diffusion_hidden_dim)
-        )
-    
+
     def forward(
         self,
         qwen_features: torch.Tensor,
@@ -188,68 +306,78 @@ class FlowMatchingDiffusion(nn.Module):
         deepstack_features: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Forward pass for flow matching
-        
+        Forward pass for flow matching.
+
         Args:
-            qwen_features: Hidden states from Qwen3-VL [B, L, D]
-            noisy_actions: Noisy action sequence [B, action_dim * action_horizon]
+            qwen_features: Hidden states from Qwen3-VL [B, L, D_qwen]
+            noisy_actions: Noisy action sequence [B, action_horizon, action_dim]
             timesteps: Diffusion timesteps [B]
-            robot_state: Current robot proprioception [B, state_dim]
-            deepstack_features: Optional multi-level features from Qwen3's DeepStack
-        
+            robot_state: Current robot proprioception [B, action_dim]
+            deepstack_features: Optional multi-level features [B, L, 2*D_qwen]
+
         Returns:
-            Predicted velocity field [B, action_dim * action_horizon]
+            Predicted velocity field [B, action_horizon, action_dim]
         """
         B = qwen_features.shape[0]
         device = qwen_features.device
-        
+        H = self.config.action_horizon
+
         # Time embedding
         t_emb = self.time_embed(timesteps)  # [B, D]
-        
-        # Project Qwen3 features
+
+        # Project VL features
         vl_features = self.qwen_projection(qwen_features)  # [B, L, D]
-        
-        # Incorporate DeepStack features if available
+
+        # Add DeepStack features if available
         if deepstack_features is not None and self.config.use_deepstack_features:
-            deep_features = self.deepstack_projection(deepstack_features)
+            pooled_deep = deepstack_features.mean(dim=1)  # [B, 2*D_qwen]
+            deep_features = self.deepstack_projection(pooled_deep)  # [B, D]
             vl_features = vl_features + deep_features.unsqueeze(1)
-        
-        # Encode noisy actions
-        action_emb = self.action_encoder(noisy_actions)  # [B, D]
-        
-        # Add proprioception if available
+
+        # Encode noisy actions PER TIMESTEP
+        # noisy_actions: [B, H, action_dim] -> action_tokens: [B, H, D]
+        action_tokens = self.action_encoder(noisy_actions)  # [B, H, D]
+
+        # Add positional embeddings to action tokens
+        action_tokens = action_tokens + self.action_pos_embed  # [B, H, D]
+
+        # Add timestep embedding to action tokens
+        action_tokens = action_tokens + t_emb.unsqueeze(1)  # [B, H, D]
+
+        # Encode robot state as a separate STATE TOKEN
         if robot_state is not None:
-            proprio_emb = self.proprio_encoder(robot_state)  # [B, D]
-            action_emb = action_emb + proprio_emb
-        
-        # Expand action queries
-        queries = self.action_queries.expand(B, -1, -1)  # [B, H, D]
-        
-        # Add time conditioning to queries
-        queries = queries + t_emb.unsqueeze(1)  # [B, H, D]
-        
-        # Add action information to queries
-        queries[:, 0, :] = queries[:, 0, :] + action_emb  # First query gets action info
-        
-        # Spatial-aware cross-attention (leveraging Qwen3's improved spatial understanding)
-        attended_features, _ = self.spatial_cross_attention(
-            queries, vl_features, vl_features
-        )  # [B, H, D]
-        
-        # Self-attention refinement
-        refined_features = self.transformer(attended_features)  # [B, H, D]
-        
-        # Combine with original queries (residual)
-        combined = torch.cat([
-            refined_features.flatten(1, 2), 
-            action_emb.unsqueeze(1).expand(-1, self.config.action_horizon, -1).flatten(1, 2)
-        ], dim=-1)
-        
-        # Decode to velocity field
-        velocity = self.action_decoder(combined)  # [B, action_dim * action_horizon]
-        
+            state_token = self.state_encoder(robot_state)  # [B, D]
+            state_token = state_token.unsqueeze(1)  # [B, 1, D]
+        else:
+            # If no state provided, use zeros
+            state_token = torch.zeros(B, 1, self.config.diffusion_hidden_dim, device=device)
+
+        # Build sequence: [state_token, future_tokens, action_tokens] (like GR00T)
+        # Future tokens provide learnable planning context
+        if self.num_future_tokens > 0:
+            # Expand future tokens for batch
+            future_tokens = self.future_tokens.expand(B, -1, -1)  # [B, num_future, D]
+            sequence = torch.cat([state_token, future_tokens, action_tokens], dim=1)  # [B, 1+F+H, D]
+        else:
+            sequence = torch.cat([state_token, action_tokens], dim=1)  # [B, 1+H, D]
+
+        # Apply DiT blocks with interleaved self-attention and cross-attention
+        for block in self.dit_blocks:
+            sequence = block(sequence, vl_features, t_emb)
+
+        # Final normalization
+        sequence = self.final_norm(sequence, t_emb)
+
+        # Extract action tokens (skip state token and future tokens)
+        # Sequence is [state(1), future(F), actions(H)] -> extract actions
+        skip_tokens = 1 + self.num_future_tokens  # Skip state + future tokens
+        action_output = sequence[:, skip_tokens:, :]  # [B, H, D]
+
+        # Decode to velocity per timestep
+        velocity = self.action_decoder(action_output)  # [B, H, action_dim]
+
         return velocity
-    
+
     @torch.no_grad()
     def sample(
         self,
@@ -260,48 +388,48 @@ class FlowMatchingDiffusion(nn.Module):
         deepstack_features: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Sample actions using flow matching ODE solver
-        
+        Sample actions using flow matching ODE solver.
+
         Args:
             qwen_features: Hidden states from Qwen3-VL [B, L, D]
-            robot_state: Current robot state [B, state_dim]
+            robot_state: Current robot state [B, action_dim]
             num_steps: Number of diffusion steps
             temperature: Sampling temperature for diversity
             deepstack_features: Optional multi-level features
-        
+
         Returns:
             Sampled action sequence [B, action_horizon, action_dim]
         """
         if num_steps is None:
             num_steps = self.config.diffusion_steps
-            
+
         B = qwen_features.shape[0]
         device = qwen_features.device
-        
-        # Initialize from noise
+        dtype = qwen_features.dtype
+
+        # Initialize from noise [B, H, action_dim]
         x = torch.randn(
-            B, 
-            self.config.action_dim * self.config.action_horizon,
-            device=device
+            B,
+            self.config.action_horizon,
+            self.config.action_dim,
+            device=device,
+            dtype=dtype
         ) * temperature
-        
-        # ODE integration with adaptive step size
+
+        # ODE integration
         dt = 1.0 / num_steps
-        
+
         for i in range(num_steps):
             t = torch.full((B,), i * dt, device=device)
-            
+
             # Predict velocity field
             with torch.cuda.amp.autocast(enabled=True):
                 v = self.forward(qwen_features, x, t, robot_state, deepstack_features)
-            
+
             # Euler integration
             x = x + v * dt
-        
-        # Reshape to [B, action_horizon, action_dim]
-        actions = x.reshape(B, self.config.action_horizon, self.config.action_dim)
-        
-        return actions
+
+        return x
 
 
 class VLAModel(nn.Module):
@@ -320,20 +448,32 @@ class VLAModel(nn.Module):
         # Load with appropriate settings
         model_kwargs = {
             "torch_dtype": torch.bfloat16,
-            "device_map": None  # We'll handle device placement
+            "device_map": None,  # We'll handle device placement
+            "local_files_only": True,  # Use cached files only to avoid DDP race conditions
         }
         
         # Add flash attention if supported
         if config.use_flash_attention:
             model_kwargs["attn_implementation"] = "flash_attention_2"
         
-        self.qwen_model = VLForConditionalGeneration.from_pretrained(
-            config.qwen_model_name,
-            **model_kwargs
-        )
+        try:
+            self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                config.qwen_model_name,
+                **model_kwargs
+            )
+        except ImportError as e:
+            if config.use_flash_attention:
+                print("FlashAttention2 not available; retrying without it.")
+                model_kwargs.pop("attn_implementation", None)
+                self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    config.qwen_model_name,
+                    **model_kwargs
+                )
+            else:
+                raise e
         
         # Load processor for preprocessing
-        self.processor = AutoProcessor.from_pretrained(config.qwen_model_name)
+        self.processor = AutoProcessor.from_pretrained(config.qwen_model_name, local_files_only=True)
         
         # Apply LoRA if specified
         if config.use_lora:
@@ -345,6 +485,10 @@ class VLAModel(nn.Module):
         # Diffusion action head
         self.action_head = FlowMatchingDiffusion(config)
         
+        # Truncate layers if using early exit (must be before hooks)
+        if config.use_early_exit:
+            self._truncate_layers()
+
         # Register hooks for intermediate features and DeepStack
         self.intermediate_features = None
         self.deepstack_features = None
@@ -388,35 +532,81 @@ class VLAModel(nn.Module):
                         param.requires_grad = False
                 print(f"Froze first {self.config.freeze_qwen_layers} Qwen layers")
     
+    def _get_language_model(self):
+        """Get reference to language model layers, handling PEFT wrapping"""
+        if hasattr(self.qwen_model, 'model') and hasattr(self.qwen_model.model, 'language_model'):
+            return self.qwen_model.model.language_model
+        elif hasattr(self.qwen_model, 'base_model') and hasattr(self.qwen_model.base_model, 'model'):
+            # Handle PEFT wrapped model
+            return self.qwen_model.base_model.model.model.language_model
+        else:
+            return None
+
+    def _truncate_layers(self):
+        """Remove layers after hidden_layer_index for early exit (2x speedup)"""
+        lm = self._get_language_model()
+        if lm is None:
+            print("Warning: Could not find language model layers for truncation")
+            return
+
+        num_layers = len(lm.layers)
+        target_idx = self.config.hidden_layer_index
+        if target_idx < 0:
+            target_idx = num_layers + target_idx
+
+        # Keep layers 0 to target_idx (inclusive), remove the rest
+        keep_layers = target_idx + 1
+        if keep_layers < num_layers:
+            # Truncate the ModuleList
+            lm.layers = lm.layers[:keep_layers]
+            removed = num_layers - keep_layers
+            print(f"Truncated LLM: kept {keep_layers} layers, removed {removed} layers ({removed/num_layers*100:.0f}% reduction)")
+
     def _register_hooks(self):
-        """Register forward hooks to extract intermediate and DeepStack features"""
-        def hook_fn(module, input, output):
-            # Store intermediate hidden states
-            if hasattr(output, 'hidden_states') and output.hidden_states is not None:
-                self.intermediate_features = output.hidden_states[self.config.hidden_layer_index]
-                
-                # Extract multi-level features for DeepStack
-                if self.config.use_deepstack_features:
-                    # Get features from multiple layers
-                    mid_layer = len(output.hidden_states) // 2
-                    early_features = output.hidden_states[mid_layer - 2]
-                    late_features = output.hidden_states[self.config.hidden_layer_index]
-                    
-                    # Combine multi-level features
-                    self.deepstack_features = torch.cat([early_features, late_features], dim=-1)
-            elif isinstance(output, tuple) and len(output) > 0:
-                self.intermediate_features = output[0]
+        """Register forward hooks to extract intermediate features"""
+        lm = self._get_language_model()
+        if lm is None:
+            print("Warning: Could not find language model layers for hooks")
+            return
+
+        num_layers = len(lm.layers)
+        # After truncation, the last layer is our target
+        target_idx = num_layers - 1
+
+        # For deepstack: also hook an earlier layer
+        early_layer_idx = target_idx // 2
+
+        self.early_features = None
+
+        def early_hook_fn(module, input, output):
+            """Capture features from early layer for deepstack"""
+            if isinstance(output, tuple):
+                self.early_features = output[0]
             else:
-                self.intermediate_features = output
-        
-        # Register hook on the model layers
-        if hasattr(self.qwen_model, 'model') and hasattr(self.qwen_model.model, 'layers'):
-            num_layers = len(self.qwen_model.model.layers)
-            layer_idx = self.config.hidden_layer_index if self.config.hidden_layer_index >= 0 else num_layers + self.config.hidden_layer_index
-            layer_idx = max(0, min(layer_idx, num_layers - 1))
-            
-            self.qwen_model.model.layers[layer_idx].register_forward_hook(hook_fn)
-            print(f"Registered hook on layer {layer_idx}")
+                self.early_features = output
+
+        def target_hook_fn(module, input, output):
+            """Capture features from final (target) layer"""
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+            else:
+                hidden_states = output
+
+            self.intermediate_features = hidden_states
+
+            # Build deepstack features if enabled
+            if self.config.use_deepstack_features and self.early_features is not None:
+                self.deepstack_features = torch.cat([self.early_features, hidden_states], dim=-1)
+            else:
+                self.deepstack_features = None
+
+        # Register hooks
+        if self.config.use_deepstack_features:
+            lm.layers[early_layer_idx].register_forward_hook(early_hook_fn)
+            print(f"Registered deepstack hook on layer {early_layer_idx}")
+
+        lm.layers[target_idx].register_forward_hook(target_hook_fn)
+        print(f"Registered output hook on layer {target_idx}")
     
     def encode_inputs(
         self,
@@ -437,62 +627,46 @@ class VLAModel(nn.Module):
         """
         B = len(instructions)
         
-        # Prepare messages for Qwen3-VL format
+        # Prepare chat messages and images per sample
         messages_batch = []
-        for i in range(B):
-            content = []
-            
-            # Add images - Qwen3-VL supports dynamic resolution
-            for j, img in enumerate(images):
-                if isinstance(img[i], torch.Tensor):
-                    # Convert tensor to PIL
-                    img_np = img[i].cpu().numpy().transpose(1, 2, 0)
-                    img_np = (img_np * 255).astype(np.uint8)
-                    from PIL import Image
-                    pil_img = Image.fromarray(img_np)
-                else:
-                    pil_img = img[i]
-                
-                content.append({"type": "image", "image": pil_img})
-            
-            # Add instruction
-            content.append({"type": "text", "text": instructions[i]})
-            
-            messages = [{"role": "user", "content": content}]
-            messages_batch.append(messages)
+        image_inputs = []
+        for frames, instruction in zip(images, instructions):
+            content = [{"type": "image", "image": frame} for frame in frames]
+            content.append({"type": "text", "text": instruction})
+            messages_batch.append([{"role": "user", "content": content}])
+            image_inputs.append(frames)
         
-        # Process with Qwen3 processor
-        text = self.processor.apply_chat_template(
-            messages_batch[0],  # Process one at a time for now
+        # Apply chat template to each sample
+        texts = self.processor.apply_chat_template(
+            messages_batch,
             tokenize=False,
             add_generation_prompt=True
         )
         
         # Process inputs (Qwen3-VL handles any resolution)
         inputs = self.processor(
-            text=[text] * B,
-            images=[img[0] for img in images],  # Just use first image for now
+            text=texts,
+            images=image_inputs,
             return_tensors="pt",
             padding=True
         ).to(device)
         
-        # Forward pass through Qwen3
-        with torch.cuda.amp.autocast(enabled=True):
+        # Forward pass through Qwen3 (layers already truncated if use_early_exit=True)
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             outputs = self.qwen_model(
                 **inputs,
                 output_hidden_states=True,
                 return_dict=True
             )
-        
-        # Extract features
+
+        # Extract features from hooks
         if self.config.use_intermediate_hidden and self.intermediate_features is not None:
             features = self.intermediate_features
-            deepstack = self.deepstack_features if self.config.use_deepstack_features else None
+            deepstack = self.deepstack_features
         else:
-            # Use last hidden state
             features = outputs.hidden_states[-1] if outputs.hidden_states else outputs.logits
             deepstack = None
-        
+
         return features, deepstack
     
     def forward(
@@ -501,7 +675,8 @@ class VLAModel(nn.Module):
         instructions: List[str],
         actions: Optional[torch.Tensor] = None,
         timesteps: Optional[torch.Tensor] = None,
-        robot_state: Optional[torch.Tensor] = None
+        robot_state: Optional[torch.Tensor] = None,
+        compute_loss: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for training or inference
@@ -516,41 +691,40 @@ class VLAModel(nn.Module):
         Returns:
             Dictionary with 'actions' for inference or 'loss' for training
         """
-        device = images[0].device if images else robot_state.device
+        device = next(self.parameters()).device
         
         # Encode vision and language with Qwen3-VL
         qwen_features, deepstack_features = self.encode_inputs(images, instructions, device)
         
-        if self.training and actions is not None:
+        if compute_loss and actions is not None:
             # Training: compute diffusion loss
             B = actions.shape[0]
-            
-            # Flatten actions
-            actions_flat = actions.reshape(B, -1)
-            
+
+            # actions shape: [B, action_horizon, action_dim] - keep this shape!
+
             # Sample random timesteps
             if timesteps is None:
                 timesteps = torch.rand(B, device=device)
-            
-            # Sample noise
-            noise = torch.randn_like(actions_flat)
-            
-            # Flow matching interpolation
-            noisy_actions = timesteps.unsqueeze(-1) * actions_flat + \
-                          (1 - timesteps.unsqueeze(-1)) * noise
-            
-            # Predict velocity field
+
+            # Sample noise with same shape as actions
+            noise = torch.randn_like(actions)  # [B, H, action_dim]
+
+            # Flow matching interpolation (broadcast timesteps over H and action_dim)
+            t_expanded = timesteps.view(B, 1, 1)  # [B, 1, 1]
+            noisy_actions = t_expanded * actions + (1 - t_expanded) * noise
+
+            # Predict velocity field [B, H, action_dim]
             velocity_pred = self.action_head(
-                qwen_features, noisy_actions, timesteps, 
+                qwen_features, noisy_actions, timesteps,
                 robot_state, deepstack_features
             )
-            
-            # Target velocity
-            velocity_target = actions_flat - noise
-            
+
+            # Target velocity [B, H, action_dim]
+            velocity_target = actions - noise
+
             # Compute loss
             loss = F.mse_loss(velocity_pred, velocity_target)
-            
+
             return {'loss': loss}
         else:
             # Inference: sample actions

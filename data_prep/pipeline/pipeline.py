@@ -13,7 +13,6 @@ from data_prep.vitpose import infer_sequence
 from data_prep.fast_video_loader import probe_video_meta_fast, read_frames_batch_fast, sample_indices_for_fps
 from data_prep.pose3d import load_motionagformer_from_path, lift_sequence_to_3d
 from data_prep import clip_filtering as filt
-from data_prep.video_action_description import FastVideoActionDescriber as VideoActionDescriber, ActionDescription
 from data_prep.bytetrack import ByteTracker, Track
 
 logger = logging.getLogger(__name__)
@@ -58,8 +57,8 @@ def process_video(
     det_2d_model: object | None = None,
     vitpose_processor: object | None = None,
     vitpose_model: object | None = None,
-    # VLM for action description
-    action_describer: Optional[VideoActionDescriber] = None,
+    # VLM for action description (deprecated - descriptions generated separately)
+    action_describer: Optional[object] = None,
     enable_action_description: bool = False,
     # Tracking optimization
     detection_height: int = 480,  # Downsample to this height for detection
