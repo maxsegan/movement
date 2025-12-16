@@ -13,3 +13,8 @@ yolov8x.onnx
 yolov8x.engine
 *.engine
 *.onnx
+
+# Training outputs
+wandb/
+logs/
+checkpoints/
