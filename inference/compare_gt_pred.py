@@ -36,13 +36,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
     ap.add_argument("--config", required=True, help="Path to training config YAML")
     ap.add_argument("--output", default=str(Path(__file__).parent / "gt_vs_pred.mp4"), help="Output video path")
-    ap.add_argument("--action-class", type=str, default=None, help="Filter by action class (e.g., 'push up')")
+    ap.add_argument("--action-class", type=str, default="push up", help="Filter by action class (default: 'push up')")
     ap.add_argument("--sample-idx", type=int, default=0, help="Sample index within filtered set")
     ap.add_argument("--device", default="cuda:0", help="Device to run inference on")
     ap.add_argument("--gt-color", default="0,200,255", help="BGR color for GT skeleton (orange)")
     ap.add_argument("--pred-color", default="255,100,100", help="BGR color for predicted skeleton (blue)")
     ap.add_argument("--full-video", action="store_true", help="Render all frames in video (not just action horizon)")
     ap.add_argument("--native-res", action="store_true", help="Use native video resolution instead of 224x224")
+    ap.add_argument("--rolling", action="store_true", help="Rolling inference mode: run inference every 0.8s, show 0.8s horizon")
+    ap.add_argument("--horizon-sec", type=float, default=0.8, help="Horizon in seconds for rolling mode (default: 0.8)")
+    ap.add_argument("--inference-interval-sec", type=float, default=0.8, help="Inference interval in seconds for rolling mode (default: 0.8)")
     return ap.parse_args()
 
 
@@ -232,6 +235,226 @@ def project_3d_to_2d_with_bbox(
     return joints_2d
 
 
+def run_rolling_inference(args, config, model, clip, val_dataset):
+    """
+    Rolling inference mode:
+    - Run inference every inference_interval_sec (default 0.8s = 8 frames at 10fps)
+    - Show only horizon_sec (default 0.8s = 8 frames) into the future
+    - Render the full video
+    """
+    from PIL import Image
+
+    gt_color = tuple(map(int, args.gt_color.split(',')))
+    pred_color = tuple(map(int, args.pred_color.split(',')))
+
+    action_horizon = config['model_config'].get('action_horizon', 16)
+    num_input_frames = config['model_config'].get('num_frames', 4)
+    action_dim = config['model_config'].get('action_dim', 51)
+    use_joint_angles = action_dim == JOINT_ANGLES_DIM
+    resize_size = config['dataset'].get('image_size', 224)
+
+    # Pose data is at 10fps
+    pose_fps = 10.0
+    horizon_frames = int(args.horizon_sec * pose_fps)  # 0.8s = 8 frames
+    inference_interval = int(args.inference_interval_sec * pose_fps)  # 0.8s = 8 frames
+
+    print(f"Rolling inference mode:")
+    print(f"  Horizon: {args.horizon_sec}s = {horizon_frames} frames")
+    print(f"  Inference interval: {args.inference_interval_sec}s = {inference_interval} frames")
+
+    # Load pose data
+    data = np.load(clip.pose_path, allow_pickle=True)
+    poses3d = data["pose3d"].astype(np.float32)  # [F, 17, 3]
+    keypoints2d = data["keypoints2d"].astype(np.float32)  # [F, 17, 2]
+    pose_indices = data["indices"].astype(np.int32)
+    total_frames = len(poses3d)
+
+    print(f"  Total frames: {total_frames} ({total_frames/pose_fps:.1f}s)")
+
+    # Get video info
+    cap = cv2.VideoCapture(str(clip.video_path))
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # Resolution settings
+    if args.native_res:
+        out_w, out_h = orig_w, orig_h
+    else:
+        out_w = out_h = resize_size
+
+    print(f"  Output resolution: {out_w}x{out_h}")
+
+    # Setup video writer
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(str(output_path), fourcc, int(pose_fps), (out_w, out_h))
+
+    # Get description for instruction
+    desc_path = Path(clip.pose_path).parent.parent.parent / "descriptions" / clip.action_class / f"{clip.clip_id}.txt"
+    if desc_path.exists():
+        instruction = desc_path.read_text().strip()
+    else:
+        instruction = f"Task: {clip.action_class}"
+
+    # Cache for inference results: inference_start_frame -> (pred_poses, reference_pose)
+    inference_cache = {}
+
+    def get_input_images(frame_idx):
+        """Get input images for inference at given frame."""
+        images = []
+        # Sample num_input_frames evenly from the context window
+        # Use frames before and including frame_idx
+        context_start = max(0, frame_idx - num_input_frames + 1)
+        frame_indices = np.linspace(context_start, frame_idx, num_input_frames, dtype=int)
+
+        for fidx in frame_indices:
+            video_fidx = int(pose_indices[fidx])
+            cap.set(cv2.CAP_PROP_POS_FRAMES, video_fidx)
+            ok, frame = cap.read()
+            if ok:
+                # Convert BGR to RGB and resize
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb).resize((resize_size, resize_size))
+                images.append(np.array(img))
+            else:
+                # Fallback: black frame
+                images.append(np.zeros((resize_size, resize_size, 3), dtype=np.uint8))
+        return images
+
+    def run_inference_at(frame_idx):
+        """Run inference starting at frame_idx, return predicted 3D poses."""
+        if frame_idx in inference_cache:
+            return inference_cache[frame_idx]
+
+        images = get_input_images(frame_idx)
+
+        # Get robot state (current pose)
+        current_pose = poses3d[frame_idx]
+        if use_joint_angles:
+            robot_state = pose3d_to_joint_angles(current_pose)
+        else:
+            robot_state = current_pose.flatten()
+
+        with torch.no_grad():
+            pred_actions = model.get_action(
+                images=images,
+                instruction=instruction,
+                robot_state=robot_state,
+            )
+
+        # Convert predictions to 3D poses
+        if use_joint_angles:
+            pred_angles = pred_actions.reshape(action_horizon, JOINT_ANGLES_DIM)
+            pred_poses = np.zeros((action_horizon, 17, 3), dtype=np.float32)
+            reference_pose = current_pose
+            for t in range(action_horizon):
+                pred_poses[t] = joint_angles_to_pose3d(pred_angles[t], reference_pose=reference_pose)
+        else:
+            pred_poses = pred_actions.reshape(action_horizon, 17, 3)
+            reference_pose = current_pose
+
+        inference_cache[frame_idx] = (pred_poses, reference_pose)
+        return pred_poses, reference_pose
+
+    # Process each frame
+    print(f"  Rendering {total_frames} frames with rolling inference...")
+
+    for t in range(total_frames):
+        # Determine which inference to use
+        inference_start = (t // inference_interval) * inference_interval
+        inference_start = min(inference_start, total_frames - 1)
+
+        # Run inference if needed
+        pred_poses, _ = run_inference_at(inference_start)
+
+        # Get video frame
+        video_frame_idx = int(pose_indices[t])
+        cap.set(cv2.CAP_PROP_POS_FRAMES, video_frame_idx)
+        ok, frame = cap.read()
+
+        if not ok:
+            frame = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+
+        # Resize frame
+        if not args.native_res:
+            frame = cv2.resize(frame, (out_w, out_h))
+
+        # Draw GT poses for next horizon_frames (0.8s)
+        for future_offset in range(horizon_frames - 1, -1, -1):
+            future_t = t + future_offset
+            if future_t >= total_frames:
+                continue
+
+            gt_kp2d = keypoints2d[future_t].copy()
+            if not args.native_res:
+                gt_kp2d[:, 0] *= out_w / orig_w
+                gt_kp2d[:, 1] *= out_h / orig_h
+
+            # Opacity: current = 0.9, furthest = 0.3
+            if future_offset == 0:
+                alpha = 0.9
+            else:
+                alpha = 0.3 + (0.4 * (1.0 - future_offset / horizon_frames))
+
+            frame = draw_skeleton(frame, gt_kp2d, gt_color, alpha=alpha)
+
+        # Draw predicted poses for next horizon_frames (0.8s)
+        for future_offset in range(horizon_frames - 1, -1, -1):
+            # Prediction index relative to inference start
+            pred_idx = (t - inference_start) + future_offset
+            if pred_idx >= action_horizon or pred_idx < 0:
+                continue
+
+            # Get GT keypoints for alignment
+            future_t = t + future_offset
+            if future_t >= total_frames:
+                continue
+
+            gt_kp2d = keypoints2d[future_t].copy()
+            if not args.native_res:
+                gt_kp2d[:, 0] *= out_w / orig_w
+                gt_kp2d[:, 1] *= out_h / orig_h
+
+            pred_3d = pred_poses[pred_idx]
+            pred_2d_raw = pred_3d[:, :2].copy()
+
+            # Procrustes alignment
+            pred_2d_aligned = procrustes_align_2d(
+                source=pred_2d_raw,
+                target=gt_kp2d,
+                allow_scale=True,
+            )
+
+            # Opacity: current = 0.9, furthest = 0.3
+            if future_offset == 0:
+                alpha = 0.9
+            else:
+                alpha = 0.3 + (0.4 * (1.0 - future_offset / horizon_frames))
+
+            frame = draw_skeleton(frame, pred_2d_aligned, pred_color, alpha=alpha)
+
+        # Add legend and frame info
+        font_scale = 0.7 if args.native_res else 0.5
+        cv2.putText(frame, f"GT (+{args.horizon_sec}s)", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, gt_color, 2)
+        cv2.putText(frame, f"Pred (+{args.horizon_sec}s)", (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, pred_color, 2)
+
+        time_sec = t / pose_fps
+        cv2.putText(frame, f"{time_sec:.1f}s", (out_w - 60, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
+
+        writer.write(frame)
+
+        if t % 20 == 0:
+            print(f"    Frame {t}/{total_frames} ({time_sec:.1f}s), inference cache size: {len(inference_cache)}")
+
+    cap.release()
+    writer.release()
+    print(f"\nOutput saved to: {output_path}")
+
+
 def main():
     args = parse_args()
     config = load_config(args.config)
@@ -300,6 +523,11 @@ def main():
 
     print(f"\nProcessing: {clip.action_class}/{clip.clip_id}")
     print(f"  Start frame: {start_frame}")
+
+    # Rolling inference mode - render full video with inference every N seconds
+    if args.rolling:
+        run_rolling_inference(args, config, model, clip, val_dataset)
+        return
 
     # Load the sample
     sample = val_dataset[sample_idx]
@@ -457,6 +685,7 @@ def main():
             frame = draw_skeleton(frame, future_kp2d, gt_color, alpha=alpha)
 
         # Project predicted poses using Procrustes alignment to GT skeleton
+        # Only show current prediction (not all future frames) for cleaner visualization
         if not args.full_video:
             # Get current frame GT keypoints as alignment target
             gt_kp2d = all_keypoints2d[t].copy()

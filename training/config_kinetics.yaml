@@ -8,46 +8,54 @@ dataset:
   image_size: 224
   normalize_pose: true
   use_joint_angles: true  # Convert 3D positions to 22 joint angles
-  sample_stride: 3    # ~3.3Hz sampling from 10fps video -> ~30 samples per 10s clip
+  sample_stride: 16   # Non-overlapping action windows (stride >= action_horizon)
+  include_temporal_context: false  # Add "Progress: X.Xs/Y.Ys (Z%)" to prompt
+  action_focus_prompt: false  # Add prompt to focus on immediate next movements
+  video_fps: 10.0  # FPS of pose data for temporal context
+  augment_flip: true  # Double data with horizontal flip (swap L/R joints + instruction text)
   seed: 42
 
 model_config:
-  qwen_model_name: "Qwen/Qwen3-VL-4B-Instruct"
+  qwen_model_name: "/root/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17"
   qwen_hidden_size: 2560
   use_intermediate_hidden: true
-  hidden_layer_index: 18      # Middle layer (18/36) like GR00T - better spatial features
-  use_early_exit: true        # Skip layers 19-36 during inference for 2x speedup
+  hidden_layer_fraction: 0.5   # Fraction of LLM layers to use (0.5=middle, 0.75=later semantic layers)
+  hidden_layer_index: 18       # Computed from fraction: 0.5 * 36 = 18
+  use_early_exit: true         # Skip layers after hidden_layer_index for speedup
   use_deepstack_features: true
   use_flash_attention: true
-  projection_dim: 512
+  projection_dim: 1024  # Larger projection for 2x DiT (2560 -> 1024 -> 1536)
   action_dim: 22            # 22 joint angles (from 3D pose conversion)
-  diffusion_hidden_dim: 512
-  num_diffusion_layers: 8   # Increased from 4 (closer to GR00T's 12)
-  num_diffusion_heads: 8
+  diffusion_hidden_dim: 1536  # DiT hidden dim (unchanged)
+  num_diffusion_layers: 24    # Rerun L24 with diffusion_steps=2 + augment_flip to isolate DiT size effect
+  num_diffusion_heads: 24     # Attention heads (unchanged)
   num_future_tokens: 4      # Learnable future tokens for planning context (like GR00T)
   action_horizon: 16
   num_frames: 4
-  use_lora: true
-  lora_rank: 128
+  use_lora: true              # Back to LoRA
+  lora_rank: 128              # Standard rank
   lora_alpha: 128
   lora_dropout: 0.05
-  freeze_vision_encoder: true   # Frozen until 1%, then unfrozen
+  freeze_vision_encoder: true   # Frozen until unfreeze_pct
   freeze_qwen_layers: 0         # LLM uses LoRA throughout
   use_thinking_mode: false
-  diffusion_steps: 8
+  diffusion_steps: 2  # Benchmarked: fewer steps = better (error accumulates)
+  init_from_current_pose: false  # Initialize diffusion from noise (init from pose performed worse)
 
 learning_rate: 1.0e-5
+llm_learning_rate: 1.0e-6     # (unused with LoRA)
 weight_decay: 0.01
-batch_size: 16  # Reduced further for post-unfreeze (vision encoder trainable uses more VRAM)
-num_epochs: 1                  # Single epoch with 24M+ samples
-unfreeze_pct: 0.05             # Unfreeze vision encoder at 5% (~4.7K steps) - more time for action head to stabilize
-gradient_accumulation_steps: 4  # Maintains effective batch size of 64 with batch_size=16
+batch_size: 8                 # Reduced for deeper DiT (48 layers)
+num_epochs: 2                 # Two epochs (data doubled by flip augmentation)
+unfreeze_pct: 0.50            # Unfreeze vision at 50% (start of epoch 2)
+gradient_accumulation_steps: 16 # Effective batch = 8*16*4 = 512
 gradient_clip: 1.0
 use_amp: true
 gradient_checkpointing: false  # Disabled for speed (use_reentrant=False was causing 3x slowdown)
 log_every_n_steps: 1
 save_every_n_steps: 750        # Checkpoint every 750 steps
 val_max_batches: 100           # Quick validation (100 batches = 400 samples)
+perf_log_every: 100            # Log performance stats every 100 optimizer steps
 max_checkpoints: 5             # Keep only last N step checkpoints to save disk
 log_dir: logs/kinetics_vla
 checkpoint_dir: checkpoints/kinetics_vla

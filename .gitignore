@@ -18,3 +18,9 @@ yolov8x.engine
 wandb/
 logs/
 checkpoints/
+
+# Inference outputs (generated panels, videos)
+inference/paper_figures*/
+inference/paper_panels*/
+inference/paper_final*/
+inference/best_*.mp4

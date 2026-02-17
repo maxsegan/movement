@@ -27,11 +27,75 @@ import yaml
 import gc
 from PIL import Image
 import itertools
+import time
+from collections import defaultdict
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from vla_model import VLAModel, VLAConfig
 from kinetics_dataset import KineticsPoseDataset
+
+
+class PerfTimer:
+    """Performance timer for tracking training bottlenecks."""
+
+    def __init__(self, enabled: bool = True, log_every: int = 100):
+        self.enabled = enabled
+        self.log_every = log_every
+        self.timings = defaultdict(list)
+        self.step_count = 0
+        self._last_batch_end = None
+
+    def reset(self):
+        """Reset all timings."""
+        self.timings.clear()
+        self.step_count = 0
+        self._last_batch_end = None
+
+    def record(self, name: str, duration: float):
+        """Record a timing measurement."""
+        if self.enabled:
+            self.timings[name].append(duration)
+
+    def mark_batch_end(self):
+        """Mark the end of a batch for data loading timing."""
+        self._last_batch_end = time.perf_counter()
+
+    def get_data_wait_time(self) -> float:
+        """Get time spent waiting for data since last batch end."""
+        if self._last_batch_end is None:
+            return 0.0
+        return time.perf_counter() - self._last_batch_end
+
+    def step(self) -> Optional[Dict[str, float]]:
+        """Increment step counter and return stats if logging interval reached."""
+        self.step_count += 1
+        if self.step_count % self.log_every == 0:
+            return self.get_stats()
+        return None
+
+    def get_stats(self) -> Dict[str, float]:
+        """Get statistics for all recorded timings."""
+        stats = {}
+        total_time = 0
+        for name, times in self.timings.items():
+            if times:
+                mean_time = np.mean(times)
+                stats[f'perf/{name}_ms'] = mean_time * 1000
+                total_time += mean_time
+
+        # Calculate percentages
+        if total_time > 0:
+            for name, times in self.timings.items():
+                if times:
+                    mean_time = np.mean(times)
+                    stats[f'perf/{name}_pct'] = (mean_time / total_time) * 100
+
+        stats['perf/total_step_ms'] = total_time * 1000
+
+        # Clear timings after reporting
+        self.timings.clear()
+        return stats
 
 
 class VLADataset(Dataset):
@@ -218,7 +282,7 @@ class StagedTrainingScheduler:
             self.unfrozen = True
             transitioned = True
 
-            # Unfreeze vision encoder and LLM
+            # Unfreeze LLM layers only (keep vision encoder frozen)
             model_ref = self.model.module if hasattr(self.model, 'module') else self.model
             newly_unfrozen = []
 
@@ -230,17 +294,8 @@ class StagedTrainingScheduler:
                 else:
                     base_model = qwen
 
-                # Unfreeze vision encoder
-                if hasattr(base_model, 'visual'):
-                    for param in base_model.visual.parameters():
-                        param.requires_grad = True
-                        newly_unfrozen.append(param)
-                    print(f"Step {global_step} ({progress*100:.1f}%): Unfroze vision encoder")
-                elif hasattr(base_model, 'model') and hasattr(base_model.model, 'visual'):
-                    for param in base_model.model.visual.parameters():
-                        param.requires_grad = True
-                        newly_unfrozen.append(param)
-                    print(f"Step {global_step} ({progress*100:.1f}%): Unfroze vision encoder")
+                # Vision encoder stays frozen - pretrained features work well
+                print(f"Step {global_step} ({progress*100:.1f}%): Keeping vision encoder frozen")
 
                 # Unfreeze LLM layers
                 if hasattr(base_model, 'layers'):
@@ -334,11 +389,19 @@ class VLATrainer:
 
             # Wrap with DDP if distributed
             if self.distributed:
+                # Need find_unused_parameters=True when:
+                # - Full fine-tuning (no LoRA) with early exit (truncated layers have unused params)
+                use_early_exit = self.config['model_config'].get('use_early_exit', False)
+                use_lora = self.config['model_config'].get('use_lora', True)
+                find_unused = use_early_exit and not use_lora
+                if find_unused:
+                    print("DDP: find_unused_parameters=True (early exit + full fine-tuning)")
+
                 self.model = DDP(
                     self.model,
                     device_ids=[self.local_rank],
                     output_device=self.local_rank,
-                    find_unused_parameters=False,  # All params used, no need for extra graph traversal
+                    find_unused_parameters=find_unused,
                     static_graph=False  # Must be False - graph changes due to use_cache toggling
                 )
         
@@ -367,6 +430,10 @@ class VLATrainer:
         self.current_epoch = 0
         self.resumed_from_checkpoint = False  # Track if we resumed, to skip batches only once
 
+        # Performance timer for bottleneck analysis
+        perf_log_every = self.config.get('perf_log_every', 100)
+        self.perf_timer = PerfTimer(enabled=True, log_every=perf_log_every)
+
     def _init_distributed(self):
         """Initialize distributed training if launched with torchrun."""
         if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -387,10 +454,10 @@ class VLATrainer:
         if not self.model:
             return
         model_ref = self.model.module if isinstance(self.model, DDP) else self.model
-            
+
         # Separate parameter groups
         param_groups = []
-        
+
         # Diffusion head - highest learning rate
         diffusion_params = list(model_ref.action_head.parameters())
         param_groups.append({
@@ -398,10 +465,10 @@ class VLATrainer:
             'lr': self.config['learning_rate'],
             'name': 'diffusion_head'
         })
-        
+
         # Qwen LoRA parameters (if using LoRA)
         if self.config['model_config'].get('use_lora', False):
-            lora_params = [p for n, p in model_ref.qwen_model.named_parameters() 
+            lora_params = [p for n, p in model_ref.qwen_model.named_parameters()
                           if 'lora' in n.lower() and p.requires_grad]
             if lora_params:
                 param_groups.append({
@@ -409,15 +476,27 @@ class VLATrainer:
                     'lr': self.config['learning_rate'] * 0.1,  # Lower LR for LoRA
                     'name': 'lora'
                 })
-        
-        # Other trainable parameters
+        else:
+            # Full fine-tuning mode - add LLM params with very low LR
+            llm_lr = self.config.get('llm_learning_rate', self.config['learning_rate'] * 0.1)
+            llm_params = [p for n, p in model_ref.qwen_model.named_parameters()
+                         if p.requires_grad and 'visual' not in n.lower()]
+            if llm_params:
+                param_groups.append({
+                    'params': llm_params,
+                    'lr': llm_lr,
+                    'name': 'llm_full_finetune'
+                })
+                print(f"Full LLM fine-tuning enabled with LR={llm_lr}")
+
+        # Other trainable parameters (projections, etc.)
         other_params = []
         for name, param in model_ref.named_parameters():
             if param.requires_grad and not any(
                 param is p for group in param_groups for p in group['params']
             ):
                 other_params.append(param)
-        
+
         if other_params:
             param_groups.append({
                 'params': other_params,
@@ -471,6 +550,10 @@ class VLATrainer:
             max_samples_per_class=dataset_cfg.get('max_samples_per_class'),
             normalize_pose=dataset_cfg.get('normalize_pose', True),
             use_joint_angles=dataset_cfg.get('use_joint_angles', True),
+            include_temporal_context=dataset_cfg.get('include_temporal_context', False),
+            action_focus_prompt=dataset_cfg.get('action_focus_prompt', False),
+            video_fps=dataset_cfg.get('video_fps', 10.0),
+            augment_flip=dataset_cfg.get('augment_flip', False),
             seed=dataset_cfg.get('seed', 42),
         )
 
@@ -487,13 +570,16 @@ class VLATrainer:
             max_samples_per_class=dataset_cfg.get('max_samples_per_class'),
             normalize_pose=dataset_cfg.get('normalize_pose', True),
             use_joint_angles=dataset_cfg.get('use_joint_angles', True),
+            include_temporal_context=dataset_cfg.get('include_temporal_context', False),
+            action_focus_prompt=dataset_cfg.get('action_focus_prompt', False),
+            video_fps=dataset_cfg.get('video_fps', 10.0),
             seed=dataset_cfg.get('seed', 42),
         )
 
         train_sampler = None
         val_sampler = None
         if self.distributed:
-            train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False)
+            train_sampler = DistributedSampler(train_dataset, shuffle=True, drop_last=False, seed=dataset_cfg.get('seed', 42))
             val_sampler = DistributedSampler(val_dataset, shuffle=False, drop_last=False)
         # Note: Weighted sampling disabled - dataset too large (>2^24) for torch.multinomial
         # With 24M+ samples across 700 classes, distribution is reasonably balanced
@@ -564,25 +650,76 @@ class VLATrainer:
         if self.distributed and hasattr(self.train_loader, 'sampler') and isinstance(self.train_loader.sampler, DistributedSampler):
             self.train_loader.sampler.set_epoch(self.current_epoch)
 
-        # When resuming, we continue from where we left off but don't try to skip batches
-        # The shuffled order is different each run anyway, so we just continue training
-        # with the restored model/optimizer state
+        # Calculate batches to skip when resuming from checkpoint
+        # Instead of iterating and skipping (which still loads data), we create a subset sampler
+        # that starts at the correct position - this avoids loading data we don't need
+        batches_to_skip = 0
+        train_iterator = self.train_loader
         if self.resumed_from_checkpoint:
-            print(f"Resuming training from step {self.global_step} (model & optimizer restored)")
+            # Each global_step consumed gradient_accumulation_steps batches
+            batches_to_skip = self.global_step * self.config['gradient_accumulation_steps']
+            # Account for batches already consumed in previous epochs
+            batches_per_epoch = len(self.train_loader)
+            batches_to_skip = batches_to_skip % batches_per_epoch  # Position within current epoch
+
+            if batches_to_skip > 0:
+                print(f"Resuming from step {self.global_step}: creating subset sampler to skip {batches_to_skip} batches")
+                # Materialize sampler indices (fast - just index computation, no data loading)
+                if self.distributed:
+                    self.train_loader.sampler.set_epoch(self.current_epoch)
+                all_indices = list(self.train_loader.sampler)
+                # Convert batches to samples (sampler yields sample indices, not batch indices)
+                samples_to_skip = batches_to_skip * self.config['batch_size']
+                remaining_indices = all_indices[samples_to_skip:]
+                print(f"  Skipping {samples_to_skip} samples ({batches_to_skip} batches × {self.config['batch_size']} batch_size)")
+                print(f"  Original samples: {len(all_indices)}, remaining: {len(remaining_indices)}")
+
+                # Create a simple list-based sampler for the remaining indices
+                from torch.utils.data import Sampler
+                class ListSampler(Sampler):
+                    def __init__(self, indices):
+                        self.indices = indices
+                    def __iter__(self):
+                        return iter(self.indices)
+                    def __len__(self):
+                        return len(self.indices)
+
+                # Create temporary dataloader with remaining indices only
+                dataset_cfg = self.config.get('dataset', {})
+                num_workers = dataset_cfg.get('num_workers', 2)
+                mp_context = 'fork' if num_workers > 0 else None
+                train_iterator = DataLoader(
+                    self.train_loader.dataset,
+                    batch_size=self.config['batch_size'],
+                    sampler=ListSampler(remaining_indices),
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    collate_fn=collate_fn_qwen,
+                    persistent_workers=num_workers > 0,
+                    prefetch_factor=4 if num_workers > 0 else None,
+                    multiprocessing_context=mp_context
+                )
             self.resumed_from_checkpoint = False
 
-        pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
+        pbar = tqdm(train_iterator, desc=f"Epoch {self.current_epoch}", disable=not self.is_main_process)
+        self.perf_timer.mark_batch_end()  # Initialize timing
 
         for batch_idx, batch in enumerate(pbar):
+            # Time waiting for data from workers
+            data_wait = self.perf_timer.get_data_wait_time()
+            self.perf_timer.record('data_load', data_wait)
 
             if max_steps and self.global_step >= max_steps:
                 break
 
-            # Move data to device
+            # Time data transfer to GPU
+            t_start = time.perf_counter()
             actions = batch['actions'].to(self.device)
             robot_states = batch['robot_states'].to(self.device)
-            
+            self.perf_timer.record('to_device', time.perf_counter() - t_start)
+
             # Forward pass with mixed precision (bf16 matches model dtype)
+            t_start = time.perf_counter()
             if self.config.get('use_amp', True):
                 with autocast('cuda', dtype=torch.bfloat16):
                     output = self.model(
@@ -602,18 +739,26 @@ class VLATrainer:
                     compute_loss=True
                 )
                 loss = output['loss']
+            # Sync CUDA to get accurate forward time
+            torch.cuda.synchronize()
+            self.perf_timer.record('forward', time.perf_counter() - t_start)
 
             # Check for NaN loss and skip bad batches
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"Warning: NaN/Inf loss at step {self.global_step}, batch {batch_idx}, skipping...")
                 self.optimizer.zero_grad()
+                self.perf_timer.mark_batch_end()
                 continue
 
             # Gradient accumulation
             loss = loss / self.config['gradient_accumulation_steps']
 
             # Backward pass (no scaling needed for BFloat16)
+            t_start = time.perf_counter()
             loss.backward()
+            # Sync to get accurate backward time (includes DDP all-reduce)
+            torch.cuda.synchronize()
+            self.perf_timer.record('backward', time.perf_counter() - t_start)
 
             # Gradient step
             if (batch_idx + 1) % self.config['gradient_accumulation_steps'] == 0:
@@ -628,16 +773,26 @@ class VLATrainer:
                 if has_nan_grad:
                     print(f"Skipping optimizer step due to NaN gradients")
                     self.optimizer.zero_grad()
+                    self.perf_timer.mark_batch_end()
                     continue
 
+                # Time optimizer step (includes grad clip)
+                t_start = time.perf_counter()
                 nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.config['gradient_clip']
                 )
                 self.optimizer.step()
-                
                 self.optimizer.zero_grad()
+                torch.cuda.synchronize()
+                self.perf_timer.record('optimizer', time.perf_counter() - t_start)
+
                 self.global_step += 1
+
+                # Log performance stats periodically
+                perf_stats = self.perf_timer.step()
+                if perf_stats and self.is_main_process:
+                    self.log_metrics(perf_stats)
 
                 # Update training stage (handles unfreezing and LR decay)
                 stage_info = self.stage_scheduler.update(self.global_step, self.optimizer)
@@ -696,7 +851,10 @@ class VLATrainer:
             if batch_idx % 100 == 0:
                 torch.cuda.empty_cache()
                 gc.collect()
-        
+
+            # Mark batch end for data loading timing
+            self.perf_timer.mark_batch_end()
+
         avg_loss = total_loss / num_batches if num_batches > 0 else 0
         if self.distributed:
             tensor = torch.tensor([avg_loss, 1.0], device=self.device)
@@ -727,7 +885,7 @@ class VLATrainer:
 
         with torch.no_grad():
             val_total = max_batches if max_batches else len(self.val_loader)
-            for batch in tqdm(self.val_loader, desc="Validation", leave=False, total=val_total):
+            for batch in tqdm(self.val_loader, desc="Validation", leave=False, total=val_total, disable=not self.is_main_process):
                 actions = batch['actions'].to(self.device)
                 robot_states = batch['robot_states'].to(self.device)
 
@@ -832,8 +990,13 @@ class VLATrainer:
             oldest.unlink()
             print(f"Deleted old checkpoint: {oldest.name}")
 
-    def load_checkpoint(self, path: str):
-        """Load checkpoint"""
+    def load_checkpoint(self, path: str, skip_lora: bool = False):
+        """Load checkpoint
+
+        Args:
+            path: Path to checkpoint file
+            skip_lora: If True, skip loading LoRA weights (useful for changing LoRA rank)
+        """
         if not self.model:
             return
 
@@ -842,10 +1005,17 @@ class VLATrainer:
         # Get checkpoint step to determine if we need to unfreeze before loading optimizer
         checkpoint_step = checkpoint.get('global_step', 0)
 
-        # Load model state first
+        # Load model state
         model_state = checkpoint['model_state_dict']
         target_model = self.model.module if isinstance(self.model, DDP) else self.model
-        target_model.load_state_dict(model_state)
+
+        if skip_lora:
+            # Filter out LoRA weights - allows loading checkpoint with different LoRA rank
+            non_lora_state = {k: v for k, v in model_state.items() if 'lora' not in k.lower()}
+            print(f"Skipping LoRA weights: loading {len(non_lora_state)}/{len(model_state)} params")
+            target_model.load_state_dict(non_lora_state, strict=False)
+        else:
+            target_model.load_state_dict(model_state)
 
         # If checkpoint is past unfreeze point, we need to trigger unfreeze BEFORE loading optimizer
         # This ensures optimizer has matching param groups for the saved state
@@ -866,20 +1036,31 @@ class VLATrainer:
                 })
                 print(f"Added {len(self.stage_scheduler.newly_unfrozen_params)} params to optimizer")
 
-        # Now load optimizer state (param groups should match)
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        # Load optimizer state (skip if LoRA was skipped - param shapes won't match)
+        if skip_lora:
+            print("Skipping optimizer/scheduler state (LoRA rank changed)")
+            # Reset step/epoch since we're effectively starting fresh training with new LoRA
+            self.global_step = 0
+            self.current_epoch = 0
+            self.best_val_loss = float('inf')
+            self.resumed_from_checkpoint = False
+        else:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-        if 'scaler_state_dict' in checkpoint and hasattr(self, 'scaler'):
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            if 'scaler_state_dict' in checkpoint and hasattr(self, 'scaler'):
+                self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
-        self.global_step = checkpoint_step
-        self.current_epoch = checkpoint.get('current_epoch', 0)
-        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        self.resumed_from_checkpoint = True  # Mark that we resumed to enable batch skipping
+            self.global_step = checkpoint_step
+            self.current_epoch = checkpoint.get('current_epoch', 0)
+            self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+            self.resumed_from_checkpoint = True  # Mark that we resumed to enable batch skipping
 
         print(f"Loaded checkpoint from {path}")
-        print(f"Resuming from epoch {self.current_epoch}, step {self.global_step}")
+        if skip_lora:
+            print("Starting fresh training with loaded diffusion head weights (new LoRA rank)")
+        else:
+            print(f"Resuming from epoch {self.current_epoch}, step {self.global_step}")
     
     def train(self):
         """Main training loop"""
@@ -913,13 +1094,12 @@ class VLATrainer:
             # Step scheduler
             self.scheduler.step()
 
-            # Save checkpoint
-            if (epoch + 1) % 5 == 0:
-                epoch_metrics = {'train_loss': train_loss}
-                if val_loss is not None:
-                    epoch_metrics['val_loss'] = val_loss
-                self.save_checkpoint(f"checkpoint_epoch_{epoch}.pth", metrics=epoch_metrics)
-            
+            # Always save epoch checkpoint (these are never rotated - useful for LoRA rank experiments)
+            epoch_metrics = {'train_loss': train_loss}
+            if val_loss is not None:
+                epoch_metrics['val_loss'] = val_loss
+            self.save_checkpoint(f"checkpoint_epoch_{epoch}.pth", metrics=epoch_metrics)
+
             # Clear cache
             torch.cuda.empty_cache()
             gc.collect()
@@ -929,6 +1109,10 @@ class VLATrainer:
         if wandb.run:
             wandb.finish()
 
+        # Clean up distributed process group to avoid warning on exit
+        if self.distributed:
+            dist.destroy_process_group()
+
 
 def main():
     parser = argparse.ArgumentParser(description='Train Qwen-based VLA')
@@ -936,16 +1120,18 @@ def main():
                        help='Path to configuration file')
     parser.add_argument('--checkpoint', type=str, default=None,
                        help='Path to checkpoint to resume from')
-    
+    parser.add_argument('--skip-lora', action='store_true',
+                       help='Skip loading LoRA weights from checkpoint (for changing LoRA rank)')
+
     args = parser.parse_args()
-    
+
     # Create trainer
     trainer = VLATrainer(args.config)
-    
+
     # Load checkpoint if provided
     if args.checkpoint:
-        trainer.load_checkpoint(args.checkpoint)
-    
+        trainer.load_checkpoint(args.checkpoint, skip_lora=args.skip_lora)
+
     # Start training
     trainer.train()
 

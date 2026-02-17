@@ -22,7 +22,8 @@ class VLAConfig:
     # Qwen3-VL backbone - using the latest version
     qwen_model_name: str = "Qwen/Qwen3-VL-2B-Instruct"
     use_intermediate_hidden: bool = True  # Extract intermediate layers
-    hidden_layer_index: int = 18  # Which layer to extract (18 = middle of 36 layers, like GR00T)
+    hidden_layer_index: int = 18  # Which layer to extract (computed from hidden_layer_fraction if set)
+    hidden_layer_fraction: float = 0.5  # Fraction of layers to use (0.5 = middle, 0.75 = later layers)
     use_early_exit: bool = True  # Stop forward pass after hidden_layer_index for 2x speedup
     
     # Qwen3-VL specific settings
@@ -45,6 +46,7 @@ class VLAConfig:
     action_horizon: int = 8  # Predict 8 future actions at 30Hz
     action_chunking: bool = True
     num_future_tokens: int = 4  # Learnable future tokens for planning context (like GR00T)
+    init_from_current_pose: bool = False  # Initialize diffusion from current pose instead of noise
     
     # Frame processing (Qwen3-VL supports dynamic resolution)
     num_frames: int = 4  # Process 4 frames at 4Hz
@@ -385,7 +387,8 @@ class FlowMatchingDiffusion(nn.Module):
         robot_state: Optional[torch.Tensor] = None,
         num_steps: Optional[int] = None,
         temperature: float = 1.0,
-        deepstack_features: Optional[torch.Tensor] = None
+        deepstack_features: Optional[torch.Tensor] = None,
+        solver: str = "euler"
     ) -> torch.Tensor:
         """
         Sample actions using flow matching ODE solver.
@@ -396,6 +399,7 @@ class FlowMatchingDiffusion(nn.Module):
             num_steps: Number of diffusion steps
             temperature: Sampling temperature for diversity
             deepstack_features: Optional multi-level features
+            solver: ODE solver - "euler" or "rk4"
 
         Returns:
             Sampled action sequence [B, action_horizon, action_dim]
@@ -419,14 +423,63 @@ class FlowMatchingDiffusion(nn.Module):
         # ODE integration
         dt = 1.0 / num_steps
 
-        for i in range(num_steps):
-            t = torch.full((B,), i * dt, device=device)
+        def get_velocity(x_in, t_val):
+            t = torch.full((B,), t_val, device=device)
+            with torch.cuda.amp.autocast(enabled=True):
+                return self.forward(qwen_features, x_in, t, robot_state, deepstack_features)
 
-            # Predict velocity field
+        for i in range(num_steps):
+            t_i = i * dt
+
+            if solver == "euler":
+                v = get_velocity(x, t_i)
+                x = x + v * dt
+            elif solver == "rk4":
+                # 4th order Runge-Kutta
+                k1 = get_velocity(x, t_i)
+                k2 = get_velocity(x + 0.5 * dt * k1, t_i + 0.5 * dt)
+                k3 = get_velocity(x + 0.5 * dt * k2, t_i + 0.5 * dt)
+                k4 = get_velocity(x + dt * k3, t_i + dt)
+                x = x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+            else:
+                raise ValueError(f"Unknown solver: {solver}")
+
+        return x
+
+    def sample_from_noise(
+        self,
+        initial_noise: torch.Tensor,
+        qwen_features: torch.Tensor,
+        robot_state: Optional[torch.Tensor] = None,
+        num_steps: int = 8,
+        deepstack_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Sample actions starting from provided noise (for consistency training).
+
+        Args:
+            initial_noise: Starting noise [B, action_horizon, action_dim]
+            qwen_features: Hidden states from Qwen3-VL [B, L, D]
+            robot_state: Current robot state [B, action_dim]
+            num_steps: Number of diffusion steps
+            deepstack_features: Optional multi-level features
+
+        Returns:
+            Sampled action sequence [B, action_horizon, action_dim]
+        """
+        B = qwen_features.shape[0]
+        device = qwen_features.device
+
+        x = initial_noise.clone()
+        dt = 1.0 / num_steps
+
+        for i in range(num_steps):
+            t_i = i * dt
+            t = torch.full((B,), t_i, device=device)
+
             with torch.cuda.amp.autocast(enabled=True):
                 v = self.forward(qwen_features, x, t, robot_state, deepstack_features)
 
-            # Euler integration
             x = x + v * dt
 
         return x
@@ -461,10 +514,10 @@ class VLAModel(nn.Module):
                 config.qwen_model_name,
                 **model_kwargs
             )
-        except ImportError as e:
+        except (ImportError, AttributeError) as e:
             if config.use_flash_attention:
-                print("FlashAttention2 not available; retrying without it.")
-                model_kwargs.pop("attn_implementation", None)
+                print("FlashAttention2 not available; retrying with eager attention.")
+                model_kwargs["attn_implementation"] = "eager"
                 self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
                     config.qwen_model_name,
                     **model_kwargs
@@ -473,7 +526,7 @@ class VLAModel(nn.Module):
                 raise e
         
         # Load processor for preprocessing
-        self.processor = AutoProcessor.from_pretrained(config.qwen_model_name, local_files_only=True)
+        self.processor = AutoProcessor.from_pretrained(config.qwen_model_name)
         
         # Apply LoRA if specified
         if config.use_lora:
@@ -484,7 +537,10 @@ class VLAModel(nn.Module):
         
         # Diffusion action head
         self.action_head = FlowMatchingDiffusion(config)
-        
+
+        # Compute hidden_layer_index from fraction if not explicitly set
+        self._compute_layer_index()
+
         # Truncate layers if using early exit (must be before hooks)
         if config.use_early_exit:
             self._truncate_layers()
@@ -531,7 +587,23 @@ class VLAModel(nn.Module):
                     for param in layer.parameters():
                         param.requires_grad = False
                 print(f"Froze first {self.config.freeze_qwen_layers} Qwen layers")
-    
+
+    def _compute_layer_index(self):
+        """Compute hidden_layer_index from hidden_layer_fraction"""
+        lm = self._get_language_model()
+        if lm is None:
+            print("Warning: Could not find language model to compute layer index")
+            return
+
+        num_layers = len(lm.layers)
+        # Compute layer index from fraction (e.g., 0.5 = layer 18 of 36, 0.75 = layer 27 of 36)
+        computed_index = int(num_layers * self.config.hidden_layer_fraction) - 1
+        computed_index = max(0, min(computed_index, num_layers - 1))
+
+        if self.config.hidden_layer_index != computed_index:
+            print(f"Using hidden_layer_fraction={self.config.hidden_layer_fraction}: layer {computed_index} of {num_layers}")
+            self.config.hidden_layer_index = computed_index
+
     def _get_language_model(self):
         """Get reference to language model layers, handling PEFT wrapping"""
         if hasattr(self.qwen_model, 'model') and hasattr(self.qwen_model.model, 'language_model'):
@@ -730,12 +802,85 @@ class VLAModel(nn.Module):
             # Inference: sample actions
             with torch.no_grad():
                 actions = self.action_head.sample(
-                    qwen_features, robot_state, 
-                    deepstack_features=deepstack_features
+                    qwen_features, robot_state,
+                    num_steps=getattr(self, '_inference_steps', None),
+                    deepstack_features=deepstack_features,
+                    solver=getattr(self, '_inference_solver', 'euler'),
                 )
-            
+
             return {'actions': actions}
     
+    def set_inference_steps(self, num_steps: int):
+        """Set number of diffusion steps for inference."""
+        self._inference_steps = num_steps
+
+    def set_inference_solver(self, solver: str):
+        """Set ODE solver for inference ('euler' or 'rk4')."""
+        self._inference_solver = solver
+
+    def compute_consistency_loss(
+        self,
+        images: List[torch.Tensor],
+        instructions: List[str],
+        robot_state: Optional[torch.Tensor] = None,
+        step_counts: List[int] = [8, 32],
+    ) -> torch.Tensor:
+        """
+        Compute consistency loss between outputs at different step counts.
+
+        Both paths are computed with gradients - the model learns that
+        the output should be the same regardless of integration step count.
+
+        Args:
+            images: List of image frames [B, 3, H, W]
+            instructions: List of text instructions
+            robot_state: Current robot proprioception
+            step_counts: List of step counts to compare (e.g., [8, 32])
+
+        Returns:
+            Consistency loss (MSE between outputs at different step counts)
+        """
+        device = next(self.parameters()).device
+
+        # Encode inputs once (shared across all step counts)
+        qwen_features, deepstack_features = self.encode_inputs(images, instructions, device)
+
+        B = qwen_features.shape[0]
+
+        # Generate shared initial noise
+        initial_noise = torch.randn(
+            B,
+            self.config.action_horizon,
+            self.config.action_dim,
+            device=device,
+            dtype=qwen_features.dtype,
+        )
+
+        # Sample at each step count using the same initial noise
+        outputs = []
+        for num_steps in step_counts:
+            output = self.action_head.sample_from_noise(
+                initial_noise=initial_noise,
+                qwen_features=qwen_features,
+                robot_state=robot_state,
+                num_steps=num_steps,
+                deepstack_features=deepstack_features,
+            )
+            outputs.append(output)
+
+        # Consistency loss: all outputs should match
+        # Compare each pair
+        consistency_loss = torch.tensor(0.0, device=device, dtype=outputs[0].dtype)
+        num_pairs = 0
+        for i in range(len(outputs)):
+            for j in range(i + 1, len(outputs)):
+                consistency_loss = consistency_loss + F.mse_loss(outputs[i], outputs[j])
+                num_pairs += 1
+
+        consistency_loss = consistency_loss / num_pairs
+
+        return consistency_loss
+
     def get_action(
         self,
         images: List[np.ndarray],

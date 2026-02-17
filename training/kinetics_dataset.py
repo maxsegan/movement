@@ -8,6 +8,7 @@ Bounding boxes are rendered on frames to indicate the target person.
 """
 
 import hashlib
+import re
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -199,6 +200,44 @@ def pose3d_to_joint_angles(pose3d: np.ndarray) -> np.ndarray:
 
 # Number of joint angles output by pose3d_to_joint_angles
 JOINT_ANGLES_DIM = 22
+
+
+# =============================================================================
+# Horizontal Flip Augmentation Helpers
+# =============================================================================
+
+# H36M left/right joint swap pairs (left_idx, right_idx)
+_H36M_LR_PAIRS = [(4, 1), (5, 2), (6, 3), (11, 14), (12, 15), (13, 16)]
+
+
+def flip_pose3d(pose3d: np.ndarray) -> np.ndarray:
+    """Horizontally flip 3D pose: negate X-axis and swap left/right joints.
+
+    Args:
+        pose3d: [..., 17, 3] array of 3D joint positions.
+    Returns:
+        Flipped pose3d with same shape.
+    """
+    flipped = pose3d.copy()
+    flipped[..., 0] *= -1  # Negate X-axis for mirror
+    for l_idx, r_idx in _H36M_LR_PAIRS:
+        tmp = flipped[..., l_idx, :].copy()
+        flipped[..., l_idx, :] = flipped[..., r_idx, :]
+        flipped[..., r_idx, :] = tmp
+    return flipped
+
+
+def flip_instruction_text(text: str) -> str:
+    """Swap 'left'<->'right' in instruction text (case-preserving)."""
+    # Use placeholder to prevent double-swap
+    def _placeholder(m):
+        return f'\x00{m.group(0)}\x00'
+    text = re.sub(r'\b(left|right|Left|Right|LEFT|RIGHT)\b', _placeholder, text)
+    swap = {'left': 'right', 'right': 'left', 'Left': 'Right', 'Right': 'Left',
+            'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}
+    text = re.sub(r'\x00(left|right|Left|Right|LEFT|RIGHT)\x00',
+                  lambda m: swap[m.group(1)], text)
+    return text
 
 
 def _euler_to_rotation_matrix(pitch: float, roll: float, yaw: float) -> np.ndarray:
@@ -441,6 +480,10 @@ class KineticsPoseDataset(Dataset):
         max_samples_per_class: Optional[int] = None,
         normalize_pose: bool = True,
         use_joint_angles: bool = True,  # Convert 3D positions to joint angles
+        include_temporal_context: bool = False,  # Add temporal position to prompt
+        action_focus_prompt: bool = False,  # Add prompt to focus on immediate next movements
+        video_fps: float = 10.0,  # FPS of pose data for temporal context
+        augment_flip: bool = False,  # Double data with horizontal flip augmentation
         seed: int = 42,
     ):
         self.pose_dir = Path(pose_dir)
@@ -455,6 +498,10 @@ class KineticsPoseDataset(Dataset):
         self.max_samples_per_class = max_samples_per_class
         self.normalize_pose = normalize_pose
         self.use_joint_angles = use_joint_angles
+        self.include_temporal_context = include_temporal_context
+        self.action_focus_prompt = action_focus_prompt
+        self.video_fps = video_fps
+        self.augment_flip = augment_flip
         self.rng = random.Random(seed)
 
         # Build index of video clips
@@ -547,7 +594,8 @@ class KineticsPoseDataset(Dataset):
             self.rng.shuffle(self.samples)
 
     def __len__(self):
-        return len(self.samples)
+        n = len(self.samples)
+        return 2 * n if self.augment_flip else n
 
     def _load_video_frames(
         self,
@@ -591,6 +639,12 @@ class KineticsPoseDataset(Dataset):
         return frames
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
+        # Determine if this is a flipped sample (indices N..2N-1)
+        should_flip = False
+        if self.augment_flip and idx >= len(self.samples):
+            should_flip = True
+            idx = idx - len(self.samples)
+
         clip_idx, start_frame = self.samples[idx]
         clip = self.clips[clip_idx]
 
@@ -608,6 +662,10 @@ class KineticsPoseDataset(Dataset):
         if action_seq.shape[0] < self.action_horizon:
             pad = np.repeat(action_seq[-1:], self.action_horizon - action_seq.shape[0], axis=0)
             action_seq = np.concatenate([action_seq, pad], axis=0)
+
+        # Horizontal flip augmentation: flip 3D pose before joint angle conversion
+        if should_flip:
+            action_seq = flip_pose3d(action_seq)
 
         if self.use_joint_angles:
             # Convert 3D positions to joint angles (22 DOF per frame)
@@ -644,9 +702,30 @@ class KineticsPoseDataset(Dataset):
         # Load frames with bbox rendering
         images = self._load_video_frames(clip.video_path, video_frame_indices, bboxes, pose_indices)
 
+        # Flip images if augmenting
+        if should_flip:
+            images = [img.transpose(Image.FLIP_LEFT_RIGHT) for img in images]
+
         # Instruction text
         desc_body = _parse_description(clip.desc_path)
-        instruction = f"Task: {clip.action_class}. Description: {desc_body}"
+        instruction = f"Task: {clip.action_class}. Instruction: {desc_body}"
+
+        # Flip instruction text (swap left/right references)
+        if should_flip:
+            instruction = flip_instruction_text(instruction)
+
+        # Add temporal context if enabled
+        if self.include_temporal_context:
+            total_frames = len(pose3d)
+            current_time = start_frame / self.video_fps
+            total_time = total_frames / self.video_fps
+            progress_pct = (start_frame / total_frames) * 100
+            instruction += f" Progress: {current_time:.1f}s/{total_time:.1f}s ({progress_pct:.0f}%)"
+
+        # Add action focus prompt if enabled
+        if self.action_focus_prompt:
+            action_duration = self.action_horizon / self.video_fps
+            instruction += f" Based on the current body position in these frames, predict the precise movements for the next {action_duration:.1f} seconds."
 
         return {
             "images": images,
