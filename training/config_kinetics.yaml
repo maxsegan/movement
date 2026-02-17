@@ -27,7 +27,7 @@ model_config:
   projection_dim: 1024  # Larger projection for 2x DiT (2560 -> 1024 -> 1536)
   action_dim: 22            # 22 joint angles (from 3D pose conversion)
   diffusion_hidden_dim: 1536  # DiT hidden dim (unchanged)
-  num_diffusion_layers: 24    # Rerun L24 with diffusion_steps=2 + augment_flip to isolate DiT size effect
+  num_diffusion_layers: 24    # L24 with delta prediction (actions = joint_angle_deltas from current pose)
   num_diffusion_heads: 24     # Attention heads (unchanged)
   num_future_tokens: 4      # Learnable future tokens for planning context (like GR00T)
   action_horizon: 16
@@ -57,5 +57,5 @@ save_every_n_steps: 750        # Checkpoint every 750 steps
 val_max_batches: 100           # Quick validation (100 batches = 400 samples)
 perf_log_every: 100            # Log performance stats every 100 optimizer steps
 max_checkpoints: 5             # Keep only last N step checkpoints to save disk
-log_dir: logs/kinetics_vla
-checkpoint_dir: checkpoints/kinetics_vla
+log_dir: logs/kinetics_vla_delta
+checkpoint_dir: checkpoints/kinetics_vla_delta

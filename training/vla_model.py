@@ -799,14 +799,19 @@ class VLAModel(nn.Module):
 
             return {'loss': loss}
         else:
-            # Inference: sample actions
+            # Inference: sample action deltas, then add robot_state to get absolute
             with torch.no_grad():
-                actions = self.action_head.sample(
+                action_deltas = self.action_head.sample(
                     qwen_features, robot_state,
                     num_steps=getattr(self, '_inference_steps', None),
                     deepstack_features=deepstack_features,
                     solver=getattr(self, '_inference_solver', 'euler'),
                 )
+                # Convert deltas back to absolute joint angles
+                if robot_state is not None:
+                    actions = action_deltas + robot_state.unsqueeze(1)
+                else:
+                    actions = action_deltas
 
             return {'actions': actions}
     

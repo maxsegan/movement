@@ -671,8 +671,11 @@ class KineticsPoseDataset(Dataset):
             # Convert 3D positions to joint angles (22 DOF per frame)
             # Do this before normalization since joint angles are computed from relative positions
             joint_angles = np.stack([pose3d_to_joint_angles(action_seq[t]) for t in range(self.action_horizon)])
-            action_seq = joint_angles  # [H, 22]
-            robot_state = action_seq[0]  # Current joint angles as proprioception
+            robot_state = joint_angles[0].copy()  # Current joint angles as proprioception (absolute)
+            # Predict DELTAS from current pose - model learns motion residuals only
+            # This centers targets at zero, halves std (1.42 -> 0.69), and lets
+            # the model focus on motion signal instead of reproducing base pose
+            action_seq = joint_angles - robot_state[None, :]  # [H, 22] deltas
         else:
             # Legacy: use normalized 3D positions
             if self.normalize_pose:
