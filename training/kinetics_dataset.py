@@ -504,6 +504,19 @@ class KineticsPoseDataset(Dataset):
         self.augment_flip = augment_flip
         self.rng = random.Random(seed)
 
+        # Load per-DOF min-max stats for action normalization (GR00T-style)
+        stats_path = Path(__file__).parent / "action_delta_stats.npz"
+        if use_joint_angles and stats_path.exists():
+            stats = np.load(stats_path)
+            self.action_min = stats["min"]  # [22]
+            self.action_max = stats["max"]  # [22]
+            self.action_range = self.action_max - self.action_min
+            self.action_range = np.maximum(self.action_range, 1e-6)  # avoid div by zero
+        else:
+            self.action_min = None
+            self.action_max = None
+            self.action_range = None
+
         # Build index of video clips
         self.clips: List[KineticsSample] = []
         self.class_counts: Dict[str, int] = {}
@@ -673,9 +686,10 @@ class KineticsPoseDataset(Dataset):
             joint_angles = np.stack([pose3d_to_joint_angles(action_seq[t]) for t in range(self.action_horizon)])
             robot_state = joint_angles[0].copy()  # Current joint angles as proprioception (absolute)
             # Predict DELTAS from current pose - model learns motion residuals only
-            # This centers targets at zero, halves std (1.42 -> 0.69), and lets
-            # the model focus on motion signal instead of reproducing base pose
             action_seq = joint_angles - robot_state[None, :]  # [H, 22] deltas
+            # Min-max normalize deltas to [-1, 1] range per DOF (GR00T-style)
+            if self.action_min is not None:
+                action_seq = 2.0 * (action_seq - self.action_min) / self.action_range - 1.0
         else:
             # Legacy: use normalized 3D positions
             if self.normalize_pose:
