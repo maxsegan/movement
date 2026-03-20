@@ -4,16 +4,6 @@ A fully open pipeline for bootstrapping humanoid foundation models from internet
 
 **Paper:** *Bootstrapping Humanoid Foundation Models from Internet-Scale Video*
 
-## Key Results
-
-| Metric | Value |
-|---|---|
-| Joint Angle RMSE (val) | 43.7° over 22 joints, 1.6s horizon |
-| Dataset | 332K clips, 4.7M training samples from Kinetics-700 |
-| Model | 4.0B params (Qwen3-VL-4B + 1.28B DiT action head) |
-| Training compute | ~576 GPU-hours on 4x RTX Pro Blackwell |
-| Inference | Single diffusion step, <100ms at 10Hz |
-
 ## Dataset: MoveNet-332
 
 332K processed video clips from Kinetics-700 covering 704 action classes. Each clip contains 2D/3D pose sequences, 22-DoF joint angles, bounding boxes, and VLM-generated action descriptions.
