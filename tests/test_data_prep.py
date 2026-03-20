@@ -5,12 +5,6 @@ import pathlib
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 
 
-def test_prepare_sample_paths(tmp_path):
-    from data_prep.paths import prepare_sample_paths
-    raw, track = prepare_sample_paths(tmp_path, "clip")
-    assert raw == str(tmp_path / "clip.mp4")
-    assert track == tmp_path / "clip.json"
-
 def test_resample():
     from data_prep.temporal import resample
     assert resample(10, target=5).tolist() == [0, 2, 4, 6, 8]

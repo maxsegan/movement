@@ -70,7 +70,6 @@ def process_video_worker(
     result_queue: Queue,
     output_dir: Path,
     target_fps: float,
-    enable_vlm: bool,
     save_debug_videos: bool,
     verbose: bool = False
 ):
@@ -90,7 +89,6 @@ def process_video_worker(
 
     # Import here to avoid loading models in main process
     from data_prep.pipeline.pipeline import process_video
-    from data_prep.video_action_description import FastVideoActionDescriber as VideoActionDescriber
     from transformers import AutoImageProcessor, VitPoseForPoseEstimation
     from data_prep.pose3d import build_motionagformer
 
@@ -101,12 +99,6 @@ def process_video_worker(
     try:
         # Load models for this worker
         logger.info(f"Worker {worker_id}: Loading models...")
-
-        # Detection model - YOLOv8x with batch processing support
-        if verbose:
-            logger.info("Loading YOLOv8x with batch processing support")
-        from data_prep.yolo_batch_detector import load_yolo_batch_detector
-        det_model = load_yolo_batch_detector('yolov8x', device=device, verbose=verbose)
 
         # ViTPose model - use float32 for stability
         vitpose_model_id = "usyd-community/vitpose-plus-large"
@@ -136,12 +128,6 @@ def process_video_worker(
         else:
             logger.warning(f"MotionAGFormer checkpoint not found at {ckpt_path}, 3D lifting disabled")
             model_3d = None
-
-        # VLM if enabled
-        action_describer = None
-        if enable_vlm:
-            logger.info("Loading VLM for action descriptions...")
-            action_describer = VideoActionDescriber(device=device)
 
         logger.info(f"Worker {worker_id}: Models loaded successfully")
 
@@ -176,16 +162,12 @@ def process_video_worker(
                         action_output_dir,
                         target_fps=target_fps,
                         device=device,
-                        det_2d_model=det_model,
                         vitpose_processor=vitpose_processor,
                         vitpose_model=vitpose_model,
-                        action_describer=action_describer,
-                        enable_action_description=enable_vlm,
                         debug=save_debug_videos,
-                        detection_height=480,  # Use 480p for faster detection
                         model3d="MotionAGFormer.model.MotionAGFormer:MotionAGFormer" if model_3d else None,
                         ckpt3d=str(ckpt_path) if model_3d else None,
-                        verbose=verbose  # Pass verbose flag
+                        verbose=verbose,
                     )
 
                     elapsed = time.time() - start_time
@@ -196,67 +178,50 @@ def process_video_worker(
                         if npz_path.exists():
                             data = np.load(npz_path, allow_pickle=True)
 
-                            # Validate the clip
-                            try:
-                                from data_prep.clip_filtering import validate_clip_improved
+                            from data_prep.clip_filtering import validate_clip_improved
 
-                                keypoints = data.get('keypoints2d', np.array([]))
-                                scores = data.get('scores2d', np.ones_like(keypoints[..., 0]))
-                                bboxes = data.get('bboxes', np.full((keypoints.shape[0], 4), np.nan))
+                            keypoints = data.get('keypoints2d', np.array([]))
+                            scores = data.get('scores2d', np.ones_like(keypoints[..., 0]))
+                            bboxes = data.get('bboxes', np.full((keypoints.shape[0], 4), np.nan))
 
-                                is_valid, issues, classification = validate_clip_improved(
-                                    keypoints, scores, bboxes,
-                                    video_path=str(video_path),
-                                    min_confidence=0.3,
-                                    min_frames=20,
-                                    verbose=False
-                                )
+                            is_valid, issues, classification = validate_clip_improved(
+                                keypoints, scores, bboxes,
+                                video_path=str(video_path),
+                                min_confidence=0.3,
+                                min_frames=20,
+                                verbose=False
+                            )
 
-                                # Only keep VALID videos, delete others
-                                if classification == "VALID":
-                                    if verbose:
-                                        logger.info(f"Worker {worker_id}: ✅ VALID: {action_class}/{video_name} ({elapsed:.1f}s)")
-                                        logger.info(f"  Quality: {data.get('quality', [0])[0]:.3f}")
-
-                                    result_queue.put({
-                                        'status': 'valid',
-                                        'video': str(video_path),
-                                        'action_class': action_class,
-                                        'time': elapsed,
-                                        'worker_id': worker_id,
-                                        'npz_path': str(result['npz']),
-                                        'quality': float(data.get('quality', [0])[0])
-                                    })
-                                else:
-                                    # Delete invalid/partial videos
-                                    if verbose:
-                                        logger.info(f"Worker {worker_id}: ⚠️ {classification}: {action_class}/{video_name} ({elapsed:.1f}s)")
-                                        logger.info(f"  Issues: {', '.join(issues)}, Quality: {data.get('quality', [0])[0]:.3f}")
-                                        logger.info(f"  Deleting NPZ file...")
-
-                                    npz_path.unlink()  # Delete the NPZ file
-
-                                    result_queue.put({
-                                        'status': 'filtered',
-                                        'classification': classification,
-                                        'video': str(video_path),
-                                        'action_class': action_class,
-                                        'time': elapsed,
-                                        'worker_id': worker_id,
-                                        'issues': issues
-                                    })
-
-                            except ImportError:
-                                # If validation not available, keep the file
+                            if classification == "VALID":
                                 if verbose:
-                                    logger.warning(f"Worker {worker_id}: ⚠️ Validation unavailable, keeping: {action_class}/{video_name}")
+                                    logger.info(f"Worker {worker_id}: ✅ VALID: {action_class}/{video_name} ({elapsed:.1f}s)")
+                                    logger.info(f"  Quality: {data.get('quality', [0])[0]:.3f}")
+
                                 result_queue.put({
-                                    'status': 'success',
+                                    'status': 'valid',
                                     'video': str(video_path),
                                     'action_class': action_class,
                                     'time': elapsed,
                                     'worker_id': worker_id,
-                                    'npz_path': str(result['npz'])
+                                    'npz_path': str(result['npz']),
+                                    'quality': float(data.get('quality', [0])[0])
+                                })
+                            else:
+                                if verbose:
+                                    logger.info(f"Worker {worker_id}: ⚠️ {classification}: {action_class}/{video_name} ({elapsed:.1f}s)")
+                                    logger.info(f"  Issues: {', '.join(issues)}, Quality: {data.get('quality', [0])[0]:.3f}")
+                                    logger.info(f"  Deleting NPZ file...")
+
+                                npz_path.unlink()
+
+                                result_queue.put({
+                                    'status': 'filtered',
+                                    'classification': classification,
+                                    'video': str(video_path),
+                                    'action_class': action_class,
+                                    'time': elapsed,
+                                    'worker_id': worker_id,
+                                    'issues': issues
                                 })
                         else:
                             if verbose:
@@ -491,8 +456,6 @@ def main():
     # Processing settings
     parser.add_argument('--target_fps', type=float, default=30.0,
                         help='Target FPS for processing')
-    parser.add_argument('--enable_vlm', action='store_true',
-                        help='Enable VLM action descriptions')
     parser.add_argument('--debug', action='store_true',
                         help='Save debug visualization videos')
     parser.add_argument('--verbose', action='store_true',
@@ -527,7 +490,6 @@ def main():
     logger.info(f"Data root: {data_root}")
     logger.info(f"Output directory: {out_dir}")
     logger.info(f"Target FPS: {args.target_fps}")
-    logger.info(f"VLM enabled: {args.enable_vlm}")
     logger.info(f"Debug videos: {args.debug}")
     logger.info(f"Verbose logging: {args.verbose}")
     logger.info(f"Using {len(gpu_ids)} GPUs with {args.workers_per_gpu} workers each = {num_workers} total workers")
@@ -572,7 +534,7 @@ def main():
         for _ in range(args.workers_per_gpu):
             p = Process(target=process_video_worker, args=(
                 worker_id, gpu_id, video_queue, result_queue,
-                out_dir, args.target_fps, args.enable_vlm, args.debug, args.verbose
+                out_dir, args.target_fps, args.debug, args.verbose
             ))
             p.start()
             workers.append(p)

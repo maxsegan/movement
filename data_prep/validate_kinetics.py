@@ -81,39 +81,28 @@ def sample_videos(data_root: Path, num_samples: int = 256, seed: int = 42) -> Li
     return sampled
 
 
-# Import the improved validation function
-try:
-    from data_prep.clip_filtering import validate_clip_improved
-    use_improved = True
-except ImportError:
-    from data_prep.clip_filtering_strict import get_validation_status_strict
-    use_improved = False
+from data_prep.clip_filtering import validate_clip_improved
 
 def get_validation_status(npz_data: dict, video_path: str = None) -> Tuple[str, List[str]]:
     """Determine validation status using improved validation criteria."""
-    if use_improved:
-        # Use improved activity-aware validation
-        keypoints = npz_data.get('keypoints2d', np.array([]))
-        scores = npz_data.get('scores2d', np.ones_like(keypoints[..., 0]))
-        bboxes = npz_data.get('bboxes', np.full((keypoints.shape[0], 4), np.nan))
-        has_hard_cuts = bool(npz_data.get('has_hard_cuts', [False])[0]) if 'has_hard_cuts' in npz_data else False
-        hard_cut_frames = list(npz_data.get('hard_cut_frames', [])) if 'hard_cut_frames' in npz_data else []
-        tracking_switches = list(npz_data.get('tracking_switches', [])) if 'tracking_switches' in npz_data else []
+    keypoints = npz_data.get('keypoints2d', np.array([]))
+    scores = npz_data.get('scores2d', np.ones_like(keypoints[..., 0]))
+    bboxes = npz_data.get('bboxes', np.full((keypoints.shape[0], 4), np.nan))
+    has_hard_cuts = bool(npz_data.get('has_hard_cuts', [False])[0]) if 'has_hard_cuts' in npz_data else False
+    hard_cut_frames = list(npz_data.get('hard_cut_frames', [])) if 'hard_cut_frames' in npz_data else []
+    tracking_switches = list(npz_data.get('tracking_switches', [])) if 'tracking_switches' in npz_data else []
 
-        is_valid, issues, classification = validate_clip_improved(
-            keypoints, scores, bboxes,
-            video_path=video_path,
-            min_confidence=0.3,
-            min_frames=20,  # More lenient
-            verbose=False,
-            has_hard_cuts=has_hard_cuts,
-            hard_cut_frames=hard_cut_frames,
-            tracking_switches=tracking_switches
-        )
-        return classification, issues
-    else:
-        # Fallback to strict validation
-        return get_validation_status_strict(npz_data)
+    is_valid, issues, classification = validate_clip_improved(
+        keypoints, scores, bboxes,
+        video_path=video_path,
+        min_confidence=0.3,
+        min_frames=20,
+        verbose=False,
+        has_hard_cuts=has_hard_cuts,
+        hard_cut_frames=hard_cut_frames,
+        tracking_switches=tracking_switches
+    )
+    return classification, issues
 
 
 def create_debug_video(
@@ -350,7 +339,6 @@ def process_video_worker(
 
     # Import here to avoid loading models in main process
     from data_prep.pipeline.pipeline import process_video
-    from data_prep.video_action_description import FastVideoActionDescriber as VideoActionDescriber
     from transformers import AutoImageProcessor, VitPoseForPoseEstimation
     from data_prep.pose3d import build_motionagformer
 
@@ -361,11 +349,6 @@ def process_video_worker(
     try:
         # Load models for this worker
         logger.info(f"Worker {worker_id}: Loading models...")
-
-        # Detection model - YOLOv8x with batch processing support
-        logger.info("Loading YOLOv8x with batch processing support")
-        from data_prep.yolo_batch_detector import load_yolo_batch_detector
-        det_model = load_yolo_batch_detector('yolov8x', device=device)
 
         # ViTPose model - use float32 for stability
         vitpose_model_id = "usyd-community/vitpose-plus-large"
@@ -433,13 +416,9 @@ def process_video_worker(
             logger.info(f"Loaded {len(vlm_models)} VLM models successfully: {list(vlm_models.keys())}")
 
             if len(vlm_models) == 0:
-                logger.error("No VLM models loaded successfully! Falling back to default.")
-                # Fallback to single VLM
-                action_describer = VideoActionDescriber(device=device)
+                logger.error("No VLM models loaded successfully!")
         else:
-            # VLM disabled
             vlm_models = {}
-            action_describer = None
 
         logger.info(f"Worker {worker_id}: Models loaded successfully")
 
@@ -476,15 +455,10 @@ def process_video_worker(
                         npz_dir,
                         target_fps=target_fps,
                         device=device,
-                        det_2d_model=det_model,
                         vitpose_processor=vitpose_processor,
                         vitpose_model=vitpose_model,
-                        action_describer=None,  # Disable VLM in pipeline
-                        enable_action_description=False,  # We'll do VLM separately
-                        debug=False,  # We'll create our own debug video
-                        detection_height=480,  # Use 480p for faster detection
                         model3d="MotionAGFormer.model.MotionAGFormer:MotionAGFormer" if model_3d else None,
-                        ckpt3d=str(ckpt_path) if model_3d else None
+                        ckpt3d=str(ckpt_path) if model_3d else None,
                     )
                     t_process = time.time() - t_process_start
 

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 import time
 import logging
 
@@ -13,7 +13,6 @@ from data_prep.vitpose import infer_sequence
 from data_prep.fast_video_loader import probe_video_meta_fast, read_frames_batch_fast, sample_indices_for_fps
 from data_prep.pose3d import load_motionagformer_from_path, lift_sequence_to_3d
 from data_prep import clip_filtering as filt
-from data_prep.bytetrack import ByteTracker, Track
 
 logger = logging.getLogger(__name__)
 
@@ -54,14 +53,8 @@ def process_video(
     model3d: str | None = None,
     ckpt3d: str | None = None,
     # injected models/functions to avoid reloading per video
-    det_2d_model: object | None = None,
     vitpose_processor: object | None = None,
     vitpose_model: object | None = None,
-    # VLM for action description (deprecated - descriptions generated separately)
-    action_describer: Optional[object] = None,
-    enable_action_description: bool = False,
-    # Tracking optimization
-    detection_height: int = 480,  # Downsample to this height for detection
     verbose: bool = False,  # Whether to print detailed processing stats
 ) -> Dict[str, str]:
     t_start = time.time()
@@ -87,54 +80,7 @@ def process_video(
     has_hard_cuts = len(hard_cuts) > 0
     timings['hard_cut_detection'] = time.time() - t0
 
-    # Always track on sampled frames only for smart batch tracking
-    frames_to_track = frames
-
     boxes_xyxy = np.full((frames.shape[0], 4), np.nan, dtype=np.float32)
-    boxes_xyxy_all_frames = None  # For debug visualization
-
-    from torchvision.transforms.functional import to_tensor
-
-    # Initialize ByteTracker for multi-object tracking
-    tracker = ByteTracker(
-        track_thresh=0.5,     # High confidence threshold
-        track_buffer=30,      # Keep lost tracks for 30 frames
-        match_thresh=0.3,     # Lower IoU threshold for better tracking during posture changes
-        min_box_area=100      # Minimum box area
-    )
-
-    # Store all tracks for visualization
-    all_tracks_per_frame = []
-    main_track_id = None
-    tracking_switches = []
-
-    t0 = time.time()  # Start timing for detection/tracking
-    if det_2d_model is not None:
-        if debug and all_frames is not None:
-            # In debug mode: track ALL frames for smooth visualization
-            boxes_xyxy_all_frames = np.full((all_frames.shape[0], 4), np.nan, dtype=np.float32)
-
-        # Use smart batch tracking with 480p downscaling
-        from data_prep.smart_batch_tracking import smart_batch_track
-        from torchvision.transforms.functional import to_tensor
-
-        # Smart tracking: detect on sampled frames with 480p downscaling
-        boxes_xyxy, all_tracks_per_frame, tracking_stats = smart_batch_track(
-            det_model=det_2d_model,
-            frames=frames_to_track,
-            device=device,
-            to_tensor_fn=to_tensor,
-            detection_batch_size=32,
-            track_thresh=0.5,
-            match_thresh=0.3,
-            min_box_area=100,
-            hard_cuts=hard_cuts if has_hard_cuts else [],
-            downscale_detection=True,  # Enable 480p downscaling
-            detection_height=detection_height,  # Use parameter value (default 480)
-            verbose=verbose,  # Pass verbose flag
-        )
-
-    timings['detection_tracking'] = time.time() - t0
 
     t0 = time.time()
     if vitpose_processor is None or vitpose_model is None:
@@ -153,26 +99,14 @@ def process_video(
     )
     timings['pose_2d'] = time.time() - t0
     
-    t0 = time.time()
-    # Store tracking data for debug visualization
-    tracking_data = {
-        'all_tracks_per_frame': all_tracks_per_frame if 'all_tracks_per_frame' in locals() else [],
-        'main_track_id': main_track_id if 'main_track_id' in locals() else None,
-        'boxes_all_frames': boxes_xyxy_all_frames if debug and boxes_xyxy_all_frames is not None else None,
-        'all_frames': all_frames if debug and all_frames is not None else None,
-        'sampled_indices': idxs
-    }
-
     det = dict(
         keypoints=kpts,
         scores=scrs,
         bboxes=boxes_xyxy,
-        det_scores=np.zeros(frames.shape[0], dtype=np.float32),  # Placeholder
+        det_scores=np.zeros(frames.shape[0], dtype=np.float32),
         indices=idxs.astype(np.int32),
-        has_hard_cuts=has_hard_cuts if 'has_hard_cuts' in locals() else False,
-        hard_cut_frames=hard_cuts if 'hard_cuts' in locals() else [],
-        tracking_switches=tracking_switches if 'tracking_switches' in locals() else [],
-        tracking_data=tracking_data if 'tracking_data' in locals() else {},
+        has_hard_cuts=has_hard_cuts,
+        hard_cut_frames=hard_cuts,
     )
 
     # Convert COCO->H36M
@@ -205,55 +139,10 @@ def process_video(
     
     t0 = time.time()
 
-    # Generate action descriptions if enabled
-    action_descriptions = []
-    if enable_action_description and action_describer and frames.shape[0] > 0:
-        try:
-            # Process video with tracking data to get descriptions
-            descriptions = action_describer.process_video_with_tracking(
-                video_path=video_path,
-                keypoints=seq_k,
-                bboxes=det["bboxes"],
-                indices=idxs,
-                segment_duration=3.0,
-                fps=target_fps
-            )
-
-            # Convert to serializable format
-            for desc in descriptions:
-                action_descriptions.append({
-                    'frames': desc.frame_indices,
-                    'description': desc.description,
-                    'confidence': desc.confidence
-                })
-        except Exception as e:
-            print(f"Error generating action descriptions: {e}")
-    
-    timings['vlm'] = time.time() - t0
-    t0 = time.time()
-
     # Save outputs
     vp = Path(video_path)
     out_dir.mkdir(parents=True, exist_ok=True)
     npz_path = out_dir / f"{vp.stem}.npz"
-
-    # Prepare action descriptions for saving
-    if action_descriptions:
-        # Convert dataclass to dictionary for JSON serialization
-        import json
-        from dataclasses import asdict
-
-        # Convert ActionDescription objects to dictionaries
-        if hasattr(action_descriptions[0], '__dataclass_fields__'):
-            # It's a dataclass, convert to dict
-            action_dicts = [asdict(desc) for desc in action_descriptions]
-        else:
-            # Already a dict or other format
-            action_dicts = action_descriptions
-
-        action_json = json.dumps(action_dicts, default=str)  # Use default=str for any remaining numpy types
-    else:
-        action_json = "[]"
 
     np.savez_compressed(
         npz_path,
@@ -266,11 +155,8 @@ def process_video(
         density_ok=np.array([density_ok], dtype=bool),
         dynamic_ok=np.array([dynamic_ok], dtype=bool),
         quality=np.array([quality], dtype=np.float32),
-        action_descriptions=np.array([action_json], dtype=object),
-        has_hard_cuts=np.array([det.get("has_hard_cuts", False)], dtype=bool),
-        hard_cut_frames=np.array(det.get("hard_cut_frames", []), dtype=np.int32),
-        tracking_confidence=det.get("det_scores", np.zeros(frames.shape[0], dtype=np.float32)),
-        tracking_switches=np.array(det.get("tracking_switches", []), dtype=np.int32),
+        has_hard_cuts=np.array([det["has_hard_cuts"]], dtype=bool),
+        hard_cut_frames=np.array(det["hard_cut_frames"], dtype=np.int32),
     )
 
     # Optional frame dump
@@ -307,30 +193,6 @@ def process_video(
         for t in range(debug_frames.shape[0]):
             img = cv2.cvtColor(debug_frames[t], cv2.COLOR_RGB2BGR)
 
-            # Draw ALL detected people with colored boxes
-            if 'tracking_data' in det and t < len(det['tracking_data'].get('all_tracks_per_frame', [])):
-                tracks = det['tracking_data']['all_tracks_per_frame'][t]
-                main_id = det['tracking_data'].get('main_track_id')
-
-                for track in tracks:
-                    x1, y1, x2, y2 = [int(v) for v in track.bbox]
-                    color = track.color
-                    thickness = 3 if track.track_id == main_id else 1
-
-                    # Draw box with track ID
-                    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
-
-                    # Draw track ID
-                    label = f"ID:{track.track_id}"
-                    if track.track_id == main_id:
-                        label += " [MAIN]"
-
-                    # Background for text
-                    (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    cv2.rectangle(img, (x1, y1-text_h-4), (x1+text_w+4, y1), color, -1)
-                    cv2.putText(img, label, (x1+2, y1-2),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
             # Draw skeleton for main person (only on sampled frames)
             if t in keypoint_mapping:
                 kpt_idx = keypoint_mapping[t]
@@ -362,10 +224,6 @@ def process_video(
                 cv2.putText(img, "HARD CUT", (10, 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
 
-            if t in tracking_switches:
-                cv2.putText(img, "TRACKING SWITCH", (10, 90),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
-
             writer.write(img)
         writer.release()
     
@@ -376,10 +234,8 @@ def process_video(
     # Log detailed timing breakdown
     import sys
     timing_msg = (f"Pipeline timing - Load: {timings.get('video_load', 0):.1f}s, " +
-                f"Det/Track: {timings.get('detection_tracking', 0):.1f}s, " +
                 f"Pose2D: {timings.get('pose_2d', 0):.1f}s, " +
                 f"Pose3D: {timings.get('pose_3d', 0):.1f}s, " +
-                f"VLM: {timings.get('vlm', 0):.1f}s, " +
                 f"Debug: {timings.get('debug_video', 0):.1f}s, " +
                 f"Total: {timings['total']:.1f}s")
     print(timing_msg, file=sys.stderr, flush=True)
