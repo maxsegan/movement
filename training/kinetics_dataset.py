@@ -198,8 +198,41 @@ def pose3d_to_joint_angles(pose3d: np.ndarray) -> np.ndarray:
     return np.array(angles, dtype=np.float32)
 
 
-# Number of joint angles output by pose3d_to_joint_angles
-JOINT_ANGLES_DIM = 22
+def joint_angles_to_sincos(angles: np.ndarray) -> np.ndarray:
+    """Convert joint angles to interleaved sin/cos pairs.
+
+    Input:  (..., 22) raw Euler angles in radians
+    Output: (..., 44) interleaved [sin(θ1), cos(θ1), sin(θ2), cos(θ2), ...]
+
+    Sin/cos representation is always continuous (no atan2 wraparound),
+    naturally bounded to [-1, 1], and the MSE loss on it minimizes
+    chord distance on the unit circle.
+    """
+    # angles: (..., 22)
+    sin_vals = np.sin(angles)
+    cos_vals = np.cos(angles)
+    # Interleave: [sin(θ1), cos(θ1), sin(θ2), cos(θ2), ...]
+    result = np.empty(angles.shape[:-1] + (angles.shape[-1] * 2,), dtype=np.float32)
+    result[..., 0::2] = sin_vals
+    result[..., 1::2] = cos_vals
+    return result
+
+
+def sincos_to_joint_angles(sincos: np.ndarray) -> np.ndarray:
+    """Convert interleaved sin/cos pairs back to joint angles.
+
+    Input:  (..., 44) interleaved [sin(θ1), cos(θ1), ...]
+    Output: (..., 22) angles in radians via atan2
+    """
+    sin_vals = sincos[..., 0::2]
+    cos_vals = sincos[..., 1::2]
+    return np.arctan2(sin_vals, cos_vals).astype(np.float32)
+
+
+# Number of dimensions in the action representation
+# 44 = 22 joint angles × 2 (sin/cos pairs)
+JOINT_ANGLES_DIM = 44
+RAW_JOINT_ANGLES = 22  # Number of underlying physical joint angles
 
 
 # =============================================================================
@@ -264,7 +297,8 @@ def joint_angles_to_pose3d(
     Convert joint angles back to 3D skeleton positions (Forward Kinematics).
 
     Args:
-        angles: [22] array of joint angles in radians
+        angles: [22] array of joint angles in radians, or [44] sin/cos pairs.
+                If 44D, automatically converts to 22 angles via atan2.
         reference_pose: [17, 3] reference pose to extract bone lengths from.
                        If None, uses default normalized bone lengths.
         bone_lengths: Optional dict of bone lengths. If provided, overrides reference_pose.
@@ -272,6 +306,8 @@ def joint_angles_to_pose3d(
     Returns:
         pose3d: [17, 3] array of 3D joint positions
     """
+    if angles.shape[-1] == 44:
+        angles = sincos_to_joint_angles(angles)
     # Joint indices
     HIP, R_HIP, R_KNEE, R_ANKLE = 0, 1, 2, 3
     L_HIP, L_KNEE, L_ANKLE = 4, 5, 6
@@ -504,19 +540,6 @@ class KineticsPoseDataset(Dataset):
         self.augment_flip = augment_flip
         self.rng = random.Random(seed)
 
-        # Load per-DOF min-max stats for action normalization (GR00T-style)
-        stats_path = Path(__file__).parent / "action_delta_stats.npz"
-        if use_joint_angles and stats_path.exists():
-            stats = np.load(stats_path)
-            self.action_min = stats["min"]  # [22]
-            self.action_max = stats["max"]  # [22]
-            self.action_range = self.action_max - self.action_min
-            self.action_range = np.maximum(self.action_range, 1e-6)  # avoid div by zero
-        else:
-            self.action_min = None
-            self.action_max = None
-            self.action_range = None
-
         # Build index of video clips
         self.clips: List[KineticsSample] = []
         self.class_counts: Dict[str, int] = {}
@@ -681,15 +704,12 @@ class KineticsPoseDataset(Dataset):
             action_seq = flip_pose3d(action_seq)
 
         if self.use_joint_angles:
-            # Convert 3D positions to joint angles (22 DOF per frame)
-            # Do this before normalization since joint angles are computed from relative positions
+            # Convert 3D positions to joint angles, then to sin/cos pairs.
+            # Sin/cos representation avoids atan2 wraparound discontinuities
+            # and is naturally bounded to [-1, 1].
             joint_angles = np.stack([pose3d_to_joint_angles(action_seq[t]) for t in range(self.action_horizon)])
-            robot_state = joint_angles[0].copy()  # Current joint angles as proprioception (absolute)
-            # Predict DELTAS from current pose - model learns motion residuals only
-            action_seq = joint_angles - robot_state[None, :]  # [H, 22] deltas
-            # Min-max normalize deltas to [-1, 1] range per DOF (GR00T-style)
-            if self.action_min is not None:
-                action_seq = 2.0 * (action_seq - self.action_min) / self.action_range - 1.0
+            action_seq = joint_angles_to_sincos(joint_angles)  # [H, 44]
+            robot_state = action_seq[0]  # Current sin/cos state as proprioception
         else:
             # Legacy: use normalized 3D positions
             if self.normalize_pose:

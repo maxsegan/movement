@@ -22,7 +22,7 @@ import wandb
 from tqdm import tqdm
 import argparse
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import yaml
 import gc
 from PIL import Image
@@ -437,7 +437,10 @@ class VLATrainer:
     def _init_distributed(self):
         """Initialize distributed training if launched with torchrun."""
         if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-            dist.init_process_group(backend='nccl')
+            dist.init_process_group(
+                backend='nccl',
+                timeout=timedelta(minutes=30),
+            )
             self.distributed = True
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()

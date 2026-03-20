@@ -29,13 +29,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from data_prep.constants import H36M_I, H36M_J
 from training.kinetics_dataset import (
     KineticsPoseDataset, joint_angles_to_pose3d, pose3d_to_joint_angles,
+    joint_angles_to_sincos, sincos_to_joint_angles,
     JOINT_ANGLES_DIM, _parse_description,
 )
 from training.vla_model import VLAModel, VLAConfig
 
-# ── L48 config (hardcoded, independent of current training config) ──────────
+# ── Model config (current best model) ───────────────────────────────────────
 
-L48_MODEL_CONFIG = dict(
+MODEL_CONFIG = dict(
     qwen_model_name="/root/.cache/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17",
     qwen_hidden_size=2560,
     use_intermediate_hidden=True,
@@ -43,11 +44,11 @@ L48_MODEL_CONFIG = dict(
     hidden_layer_index=18,
     use_early_exit=True,
     use_deepstack_features=True,
-    use_flash_attention=False,
+    use_flash_attention=True,
     projection_dim=1024,
-    action_dim=22,
+    action_dim=44,
     diffusion_hidden_dim=1536,
-    num_diffusion_layers=48,
+    num_diffusion_layers=24,
     num_diffusion_heads=24,
     num_future_tokens=4,
     action_horizon=16,
@@ -59,11 +60,11 @@ L48_MODEL_CONFIG = dict(
     freeze_vision_encoder=True,
     freeze_qwen_layers=0,
     use_thinking_mode=False,
-    diffusion_steps=2,
+    diffusion_steps=1,
     init_from_current_pose=False,
 )
 
-L48_DATASET_CONFIG = dict(
+DATASET_CONFIG = dict(
     pose_dir="data/kinetics_processed",
     desc_dir="data/kinetics_full_output/descriptions",
     video_dir="data/kinetics-dataset/k700-2020",
@@ -74,7 +75,7 @@ L48_DATASET_CONFIG = dict(
     seed=42,
 )
 
-L48_CHECKPOINT = "checkpoints/kinetics_vla/checkpoint_step_34500.pth"
+CHECKPOINT = "checkpoints/kinetics_vla/best_model.pth"
 
 FITNESS_KEYWORDS = {
     "push up", "pull ups", "deadlifting", "jumping jacks", "squat", "lunge",
@@ -107,8 +108,8 @@ def is_fitness(action_class: str) -> bool:
 
 
 def load_model(checkpoint_path: str, device: str) -> VLAModel:
-    vla_config = VLAConfig(**L48_MODEL_CONFIG)
-    print("Loading L48 model...")
+    vla_config = VLAConfig(**MODEL_CONFIG)
+    print("Loading model...")
     model = VLAModel(vla_config)
     print(f"Loading checkpoint {checkpoint_path}...")
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -124,8 +125,8 @@ def load_model(checkpoint_path: str, device: str) -> VLAModel:
 
 
 def load_val_dataset() -> KineticsPoseDataset:
-    dc = L48_DATASET_CONFIG
-    mc = L48_MODEL_CONFIG
+    dc = DATASET_CONFIG
+    mc = MODEL_CONFIG
     return KineticsPoseDataset(
         pose_dir=dc["pose_dir"], desc_dir=dc["desc_dir"],
         video_dir=dc["video_dir"], split="val", val_split=dc["val_split"],
@@ -291,10 +292,10 @@ def find_best_intervals(dataset, action_horizon=16, min_path=0.4,
 
 def run_inference_on_intervals(model, dataset, candidates, device="cuda:0"):
     """Run inference on pre-filtered intervals (arbitrary start frames)."""
-    action_horizon = L48_MODEL_CONFIG["action_horizon"]
-    num_input_frames = L48_MODEL_CONFIG["num_frames"]
-    resize = L48_DATASET_CONFIG["image_size"]
-    normalize = L48_DATASET_CONFIG["normalize_pose"]
+    action_horizon = MODEL_CONFIG["action_horizon"]
+    num_input_frames = MODEL_CONFIG["num_frames"]
+    resize = DATASET_CONFIG["image_size"]
+    normalize = DATASET_CONFIG["normalize_pose"]
     results = []
 
     for i, cand in enumerate(candidates):
@@ -319,14 +320,17 @@ def run_inference_on_intervals(model, dataset, candidates, device="cuda:0"):
                 images.append(np.array(Image.fromarray(rgb).resize((resize, resize), Image.BILINEAR)))
             cap.release()
 
-            # Robot state
+            # Robot state as sin/cos
             rs = poses3d[start].copy()
             if normalize: rs = rs - rs[0:1]
-            robot_state = pose3d_to_joint_angles(rs)
+            rs_angles = pose3d_to_joint_angles(rs)
+            robot_state_sincos = joint_angles_to_sincos(rs_angles.reshape(1, -1))[0]  # [44]
 
-            # GT actions
+            # GT actions as sin/cos
             gt = poses3d[start:start+action_horizon].copy()
             if normalize: gt = gt - poses3d[start][0:1]
+            gt_angles = np.array([pose3d_to_joint_angles(gt[t]) for t in range(action_horizon)])
+            gt_sincos = joint_angles_to_sincos(gt_angles)  # [16, 44]
 
             try:
                 desc_body = _parse_description(clip.desc_path)
@@ -334,12 +338,19 @@ def run_inference_on_intervals(model, dataset, candidates, device="cuda:0"):
             except Exception:
                 instruction = f"A person performing {clip.action_class}"
 
+            # Use model.forward directly (get_action has a bug with multi-frame)
+            pil_images = [Image.fromarray(img) for img in images]
+            rs_tensor = torch.from_numpy(robot_state_sincos).float().unsqueeze(0).to(device)
             with torch.no_grad():
-                pred = model.get_action(images=images, instruction=instruction,
-                                        robot_state=robot_state)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    output = model.forward(
+                        [pil_images], [instruction],
+                        robot_state=rs_tensor, compute_loss=False,
+                    )
+                pred_sincos = output["actions"].squeeze(0).cpu().numpy()  # [16, 44]
 
-            pred_angles = pred.reshape(action_horizon, JOINT_ANGLES_DIM)
-            gt_angles = np.array([pose3d_to_joint_angles(gt[t]) for t in range(action_horizon)])
+            # RMSE in angle space
+            pred_angles = np.array([sincos_to_joint_angles(pred_sincos[t]) for t in range(action_horizon)])
             rmse = float(np.degrees(np.sqrt(np.mean((gt_angles - pred_angles)**2))))
 
             results.append(dict(**cand, rmse_deg=rmse))
@@ -358,10 +369,10 @@ def run_inference_on_intervals(model, dataset, candidates, device="cuda:0"):
 
 def generate_panels(model, dataset, cand, output_dir, device="cuda:0"):
     """Generate panels for an interval (arbitrary start frame)."""
-    action_horizon = L48_MODEL_CONFIG["action_horizon"]
-    num_input_frames = L48_MODEL_CONFIG["num_frames"]
-    resize = L48_DATASET_CONFIG["image_size"]
-    normalize = L48_DATASET_CONFIG["normalize_pose"]
+    action_horizon = MODEL_CONFIG["action_horizon"]
+    num_input_frames = MODEL_CONFIG["num_frames"]
+    resize = DATASET_CONFIG["image_size"]
+    normalize = DATASET_CONFIG["normalize_pose"]
 
     clip = dataset.clips[cand["clip_idx"]]
     start = cand["start_frame"]
@@ -391,18 +402,27 @@ def generate_panels(model, dataset, cand, output_dir, device="cuda:0"):
 
     rs = poses3d[start].copy()
     if normalize: rs = rs - rs[0:1]
-    robot_state = pose3d_to_joint_angles(rs)
+    rs_angles = pose3d_to_joint_angles(rs)
+    robot_state_sincos = joint_angles_to_sincos(rs_angles.reshape(1, -1))[0]
+
     try:
         desc_body = _parse_description(clip.desc_path)
         instruction = f"Task: {clip.action_class}. Instruction: {desc_body}"
     except Exception:
         instruction = f"A person performing {clip.action_class}"
 
+    pil_images = [Image.fromarray(img) for img in images]
+    rs_tensor = torch.from_numpy(robot_state_sincos).float().unsqueeze(0).to(device)
     with torch.no_grad():
-        pred = model.get_action(images=images, instruction=instruction, robot_state=robot_state)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            output = model.forward(
+                [pil_images], [instruction],
+                robot_state=rs_tensor, compute_loss=False,
+            )
+        pred_sincos = output["actions"].squeeze(0).cpu().numpy()
 
     # Convert to 3D
-    pred_angles = pred.reshape(action_horizon, JOINT_ANGLES_DIM)
+    pred_angles = np.array([sincos_to_joint_angles(pred_sincos[t]) for t in range(action_horizon)])
     ref_pose = poses3d[start]
     pred_3d = np.array([joint_angles_to_pose3d(pred_angles[t], reference_pose=ref_pose)
                         for t in range(action_horizon)])
@@ -423,7 +443,7 @@ def generate_panels(model, dataset, cand, output_dir, device="cuda:0"):
     scale = min(vw, vh) * 0.85 / max(extent, 1e-6)
     cc = np.array([vw/2, vh/2])
 
-    pred_color, gt_color = (0, 220, 220), (0, 180, 0)
+    pred_color, gt_color = (0, 215, 255), (0, 210, 0)  # BGR: yellow, green
     canvas_pred = np.zeros((vh, vw, 3), np.uint8)
     canvas_gt = np.zeros((vh, vw, 3), np.uint8)
     canvas_cmp = np.zeros((vh, vw, 3), np.uint8)
@@ -501,6 +521,22 @@ def generate_panels(model, dataset, cand, output_dir, device="cuda:0"):
     composite3 = np.concatenate(parts3, axis=1)
     cv2.imwrite(str(sub / "composite_3panel.png"), composite3)
 
+    # Compare composite: [current | compare (GT+pred) | future]  — matches figure_A_compare format
+    panels_cmp = [frame_now, canvas_cmp, frame_future]
+    resized_cmp = []
+    for p in panels_cmp:
+        ph, pw = p.shape[:2]
+        scale_f = target_h / ph
+        new_w = int(pw * scale_f)
+        resized_cmp.append(cv2.resize(p, (new_w, target_h)))
+    parts_cmp = []
+    for i, r in enumerate(resized_cmp):
+        parts_cmp.append(r)
+        if i < len(resized_cmp) - 1:
+            parts_cmp.append(sep)
+    composite_cmp = np.concatenate(parts_cmp, axis=1)
+    cv2.imwrite(str(sub / "composite_compare.png"), composite_cmp)
+
     print(f"  Saved to {sub}/")
     return sub
 
@@ -542,7 +578,7 @@ def main():
 
     # Phase 2: Inference on top intervals
     print(f"\n=== Phase 2: Running inference on top {len(intervals)} intervals ===")
-    model = load_model(L48_CHECKPOINT, args.device)
+    model = load_model(CHECKPOINT, args.device)
     results = run_inference_on_intervals(model, dataset, intervals, args.device)
 
     print(f"\nTop 15 by RMSE:")

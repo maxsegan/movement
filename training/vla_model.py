@@ -14,7 +14,6 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
 from peft import LoraConfig, get_peft_model, TaskType
 import warnings
-from pathlib import Path
 
 
 @dataclass
@@ -36,7 +35,7 @@ class VLAConfig:
     projection_dim: int = 1024
     
     # Enhanced diffusion head for Qwen3 features
-    action_dim: int = 22  # Adjust based on your humanoid DOF
+    action_dim: int = 44  # 22 joint angles × 2 (sin/cos pairs)
     diffusion_hidden_dim: int = 768  # Larger for richer Qwen3 features
     num_diffusion_layers: int = 8
     num_diffusion_heads: int = 12
@@ -539,16 +538,6 @@ class VLAModel(nn.Module):
         # Diffusion action head
         self.action_head = FlowMatchingDiffusion(config)
 
-        # Load action normalization stats (for denormalizing inference output)
-        stats_path = Path(__file__).parent / "action_delta_stats.npz"
-        if stats_path.exists():
-            stats = np.load(stats_path)
-            self.register_buffer('action_min', torch.from_numpy(stats["min"]).float())
-            self.register_buffer('action_range', torch.from_numpy(stats["max"] - stats["min"]).float().clamp(min=1e-6))
-        else:
-            self.action_min = None
-            self.action_range = None
-
         # Compute hidden_layer_index from fraction if not explicitly set
         self._compute_layer_index()
 
@@ -785,10 +774,9 @@ class VLAModel(nn.Module):
 
             # actions shape: [B, action_horizon, action_dim] - keep this shape!
 
-            # Sample timesteps from Beta(1.5, 1) distribution (GR00T N1 schedule)
-            # Biases toward lower noise levels for better fine-grained denoising
+            # Sample random timesteps
             if timesteps is None:
-                timesteps = torch.distributions.Beta(1.5, 1.0).sample((B,)).to(device)
+                timesteps = torch.rand(B, device=device)
 
             # Sample noise with same shape as actions
             noise = torch.randn_like(actions)  # [B, H, action_dim]
@@ -811,26 +799,14 @@ class VLAModel(nn.Module):
 
             return {'loss': loss}
         else:
-            # Inference: sample normalized action deltas, denormalize, add robot_state
+            # Inference: sample actions
             with torch.no_grad():
-                action_deltas_norm = self.action_head.sample(
+                actions = self.action_head.sample(
                     qwen_features, robot_state,
                     num_steps=getattr(self, '_inference_steps', None),
                     deepstack_features=deepstack_features,
                     solver=getattr(self, '_inference_solver', 'euler'),
                 )
-                # Denormalize from [-1, 1] back to raw deltas
-                if self.action_min is not None:
-                    action_min = self.action_min.to(action_deltas_norm.dtype)
-                    action_range = self.action_range.to(action_deltas_norm.dtype)
-                    action_deltas = (action_deltas_norm + 1.0) / 2.0 * action_range + action_min
-                else:
-                    action_deltas = action_deltas_norm
-                # Convert deltas back to absolute joint angles
-                if robot_state is not None:
-                    actions = action_deltas + robot_state.unsqueeze(1)
-                else:
-                    actions = action_deltas
 
             return {'actions': actions}
     

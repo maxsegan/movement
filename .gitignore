@@ -24,3 +24,13 @@ inference/paper_figures*/
 inference/paper_panels*/
 inference/paper_final*/
 inference/best_*.mp4
+
+# Results (ephemeral)
+inference/*_results*.json
+inference/candidates/
+
+# Paper intermediate files
+paper_draft_docs/figures/*.json
+paper_draft_docs/figures/.cache/
+paper_draft_docs/figures/best_candidates/
+paper_overleaf.tar.gz
