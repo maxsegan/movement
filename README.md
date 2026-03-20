@@ -20,7 +20,7 @@ A fully open pipeline for bootstrapping humanoid foundation models from internet
 
 **Stats:** 4.7M training samples, 96K validation samples, 10Hz frame rate, ~24s per clip.
 
-<!-- TODO: Add HuggingFace dataset URL once published -->
+**Download:** [maxsegan/movenet-332 on HuggingFace](https://huggingface.co/datasets/maxsegan/movenet-332)
 
 ## Model
 
@@ -30,7 +30,7 @@ Dual-system architecture following GR00T N1:
 - **System 1 (action head):** 24-layer Diffusion Transformer (1.28B params) with AdaLN timestep conditioning and cross-attention to Qwen hidden states
 - **Output:** 22 joint angles (sin/cos encoded) over 16 future timesteps at 10Hz
 
-<!-- TODO: Add HuggingFace model URL once published -->
+**Weights:** [maxsegan/mimic-vlam on HuggingFace](https://huggingface.co/maxsegan/mimic-vlam)
 
 ## Repository Structure
 
