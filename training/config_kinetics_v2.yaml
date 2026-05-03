@@ -2,7 +2,7 @@ dataset:
   pose_dir: data/kinetics_v2_strict
   desc_dir: data/kinetics_v2_strict_desc
   video_dir: data/kinetics_videos_full   # flat layout — patched loader auto-detects
-  val_split: 0.02
+  val_split: 0.05  # ~5k clips for val (clip-id hash distribution skews high; 0.02 yields zero)
   max_samples_per_class: null
   num_workers: 8
   image_size: 224
@@ -16,7 +16,7 @@ dataset:
   seed: 42
 
 model_config:
-  qwen_model_name: "Qwen/Qwen3-VL-4B-Instruct"   # resolved from HF cache
+  qwen_model_name: "/home/max/movement/models/qwen3-vl-4b-cache/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17"
   qwen_hidden_size: 2560
   use_intermediate_hidden: true
   hidden_layer_fraction: 0.5   # Fraction of LLM layers to use (0.5=middle, 0.75=later semantic layers)

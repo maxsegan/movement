@@ -28,10 +28,13 @@ fi
 echo "[$(date -u +%H:%M:%S)] launching DDP training: nproc=$NPROC config=$CONFIG"
 echo "[$(date -u +%H:%M:%S)] log: $LOG"
 
-cd training
+# train_vla.py uses sibling imports (vla_model, kinetics_dataset). Add the
+# training/ dir to PYTHONPATH and run from the repo root so dataset paths
+# in the config resolve correctly.
+export PYTHONPATH="$REPO/training:${PYTHONPATH:-}"
 nohup /usr/bin/python3.12 -m torch.distributed.run \
     --standalone --nproc_per_node="$NPROC" \
-    train_vla.py --config "../$CONFIG" $CKPT_ARG > "$LOG" 2>&1 &
+    training/train_vla.py --config "$CONFIG" $CKPT_ARG > "$LOG" 2>&1 &
 TRAIN_PID=$!
 echo "TRAIN_PID=$TRAIN_PID"
 echo "follow: tail -f $LOG"
