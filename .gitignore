@@ -31,3 +31,35 @@ inference/candidates/
 
 # Paper draft (kept locally only)
 paper_draft_docs/
+# Phase 2 retrack outputs (large)
+tests/phase2_npz_s*/
+tests/phase2_results_*.json
+tests/phase2_rejudge.json
+tests/phase2_results_all.json
+tests/phase2_retracked_ok.txt
+tests/scale_strat332k.json
+tests/scale_strat332k_combined.json
+tests/scale_strat10k.json
+tests/scale_strat500.json
+tests/scale_smoke50.json
+tests/retrack_smoke.json
+tests/retrack_smoke/
+tests/full_325k.txt
+tests/stratified_10k.txt
+tests/retrack_cands_*.txt
+tests/final_composite.json
+
+# v2 dataset artifacts (data/, regenerable)
+data/movement-strict-v2/
+data/movement-vlm-good-v2/
+data/kinetics_v2_strict/
+data/kinetics_v2_strict_desc/
+data/kinetics_v2_vlm_good/
+data/kinetics_v2_vlm_good_desc/
+
+# Qwen download cache
+models/qwen3-vl-4b-cache/
+
+# Logs / checkpoints
+logs/kinetics_v2_*/
+checkpoints/kinetics_v2_*/

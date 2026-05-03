@@ -563,13 +563,17 @@ class KineticsPoseDataset(Dataset):
             clip_id = desc_path.stem
             pose_path = self.pose_dir / action_class / f"{clip_id}.npz"
 
-            # Find original video (try both train and val subdirs)
+            # Find original video — try class-hierarchy first, then flat dir
             video_path = None
             for subdir in ["train", "val", "test"]:
                 candidate = self.video_dir / subdir / action_class / f"{clip_id}.mp4"
                 if candidate.exists():
                     video_path = candidate
                     break
+            if video_path is None:
+                flat = self.video_dir / f"{clip_id}.mp4"
+                if flat.exists():
+                    video_path = flat
 
             if not pose_path.exists() or video_path is None:
                 continue
