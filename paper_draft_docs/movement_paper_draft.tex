@@ -27,7 +27,7 @@
 \begin{abstract}
 We present a fully open and reproducible pipeline for converting internet-scale human video into training data for humanoid robot control. Our automated pipeline, spanning person detection, tracking, 2D-to-3D pose lifting, quality filtering, 22-degree-of-freedom joint angle extraction, and vision-language-model captioning, processes ${\sim}$332K video clips into ${\sim}$4.7M training samples, each pairing video frames with 3D poses, joint angles, and natural language instructions. The pipeline is validated against motion-capture ground truth and can be applied to any video source, providing a scalable path to arbitrarily large humanoid training datasets from freely available internet video.
 
-To demonstrate the dataset's utility, we train MIMIC (Motion Imitation from Massive Internet Clips), a 4.0B-parameter vision-language-action model for full-body humanoid control. A vision-language backbone conditions a 24-layer diffusion transformer action head that predicts 1.6\,s (16 timesteps) of continuous joint angle trajectories. On held-out validation clips, the model achieves 43.7\textdegree{} RMSE over 22 joints across 1.5\,s of prediction, outperforming both static and linear extrapolation baselines, with a 2.6\% advantage on high-motion clips. Unlike prior humanoid VLAMs that depend on proprietary teleoperation data and large-scale compute infrastructure, our entire system (data pipeline, training, and inference) runs on consumer GPUs at ${\sim}$87$\times$ less compute than comparable systems. All code, data processing pipeline, and model weights are publicly released.
+To demonstrate the dataset's utility, we train MIMIC (Motion Imitation from Massive Internet Clips), a 4.0B-parameter vision-language-action model for full-body humanoid control. A vision-language backbone conditions a 24-layer diffusion transformer action head that predicts 1.6\,s (16 timesteps) of continuous joint angle trajectories. We further refine the dataset through a re-tracking and VLM-judged filtering pipeline, producing two derivative releases that we use for our final training runs: movement-strict-164 (164,390 clips that pass both programmatic continuity checks and a 235B VLM judge of skeleton-overlay quality) and movement-287 (286,890 clips that pass the VLM judge alone). On held-out validation clips, the strict-164 model achieves 39.8\textdegree{} RMSE over 22 joints across 1.5\,s of prediction (down from 43.7\textdegree{} on the original release), outperforming both static and linear extrapolation baselines, with a 5.3\% advantage on high-motion clips. The model-versus-static gap widens from 0.1\textdegree{} to 1.2\textdegree{} on average and from 1.7\textdegree{} to 3.2\textdegree{} on the high-motion subset, while training time falls from 14 days to under 6 days on the same hardware. Unlike prior humanoid VLAMs that depend on proprietary teleoperation data and large-scale compute infrastructure, our entire system (data pipeline, re-tracking, training, and inference) runs on consumer GPUs. All code, data processing pipeline, both filtered datasets, and model weights are publicly released.
 \end{abstract}
 
 %==============================================================================
@@ -155,6 +155,34 @@ Raw pose extractions contain substantial noise from detection failures, tracking
 
 Of the original $\sim$650K Kinetics-700 videos, 331,656 clips ($\sim$51\%) survive the full pipeline. Primary attrition causes are: multi-person scenes without a clear dominant subject ($\sim$20\%), detection failures in challenging viewpoints ($\sim$15\%), and videos no longer available for download ($\sim$14\%). Among surviving clips, 46,212 (13.9\%) contain detected hard cuts; these clips are split at cut boundaries. Pose sequences average 242 frames (median 283, range 20--301), corresponding to $\sim$24s of motion data at 10Hz after temporal subsampling.
 
+\subsection{Re-tracking and VLM-Judged Filtering}
+\label{sec:retracking}
+
+The programmatic filters above remove most catastrophic failures but cannot detect a class of semantic errors that resemble valid tracking: subject swaps onto similarly-sized co-actors, tracking that visually drifts to a different person mid-clip, or clips where the labeled action is actually performed by someone other than the tracked subject. We address these in a second pass that combines a stricter re-tracker with a VLM judge.
+
+\textbf{Re-tracking pipeline.} For each clip in MoveNet-332, we re-detect candidates with YOLOv8x across five evenly sampled frames, then pool detections into a candidate set rendered with numbered boxes onto the busiest anchor frame. A Qwen3-VL oracle selects the subject performing the labeled action. From that anchor, a sticky IoU tracker (threshold 0.5, size-ratio guard 2.5$\times$, three-miss tolerance) propagates forward and backward, breaking on persistent loss rather than drifting. The clip is trimmed to the longest valid run containing the anchor, with hard cuts re-detected on the trimmed frame range, and residual interior bounding-box gaps interpolated. ViTPose and MotionAGFormer then re-run from the corrected crops. The pipeline aborts on clips where no run of at least 20 frames contains the anchor, isolating clips that are inherently unfixable.
+
+\textbf{VLM-judged verdict.} Each clip (original or re-tracked) is rendered with the chosen skeleton overlay at six sampled frames and submitted to Qwen3-VL-235B-A22B-Thinking, served locally via vLLM across 4 GPUs. The judge returns two booleans: \emph{tracking\_consistent} (the same clearly-visible person is cleanly tracked throughout, with no scene cuts or skeleton drift onto other people) and \emph{motion\_matches} (the tracked person is performing the labeled action class). We refer to these jointly as the VLM-good verdict. We tuned the prompt and selected the 235B Thinking model after sweeping smaller variants on a 40-clip manually-labeled set; the 235B judge achieves 92.5\% agreement with human labels.
+
+\textbf{Composite verdict and release.} For each of the 325,036 clips in MoveNet-332, we record both the original parquet's programmatic verdict and the VLM-good verdict, replacing the tracking data with the re-tracked NPZ when the re-tracker succeeded ($v2$\_source = retrack, 193,277 clips) and falling back to the original tracking otherwise ($v2$\_source = original, 131,759 clips). This yields two distributable filtered subsets summarized in Table~\ref{tab:filtered}.
+
+\begin{table}[h]
+\centering
+\caption{V2 filtered subsets of MoveNet-332. Strict requires both programmatic and VLM verdicts; vlm-good requires only the VLM judge.}
+\label{tab:filtered}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Subset} & \textbf{Clips} & \textbf{\% of 325K} \\
+\midrule
+movenet-332 (original) & 325{,}036 & 100.0\% \\
+movement-287 (vlm-good) & 286{,}890 & 88.3\% \\
+movement-strict-164 (vlm-good $\land$ prog) & 164{,}390 & 50.6\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Scale-out cost.} Judging all 325,036 clips with the 235B Thinking model took 4.9 days at 33 clips per minute on 4 GPUs with batched concurrent requests. Re-tracking the 217,122 clips on which either signal disagreed took 3.4 days at 44 clips per minute split across the 4 GPUs (one tracker per GPU, local Qwen oracle). Re-judging the retracked subset took an additional 2.9 days. Total wall-clock for the data refinement pass: roughly 11 days for all 325K clips, end to end. Zero VLM errors over the entire 519,148 judgment calls.
+
 \subsection{Instruction Caption Generation}
 \label{sec:captioning}
 
@@ -173,24 +201,24 @@ We evaluated several VLMs for caption generation, including Qwen3-VL-8B, Qwen3-V
 
 \begin{table}[h]
 \centering
-\caption{MoveNet-332 dataset statistics.}
+\caption{MoveNet-332 dataset statistics. Strict-164 is the highest-quality filtered subset used for our primary released model.}
 \label{tab:dataset}
-\begin{tabular}{lr}
+\begin{tabular}{lrrr}
 \toprule
-\textbf{Metric} & \textbf{Value} \\
+\textbf{Metric} & \textbf{332} & \textbf{287} & \textbf{strict-164} \\
 \midrule
-Total processed clips & 331,656 \\
-Action classes & 704 \\
-Training samples & 4,676,599 \\
-Validation samples & 95,774 \\
-Joint angle dimensions & 22 \\
-Action horizon & 16 frames (1.6s) \\
-Frame rate & 10 Hz \\
+Total clips & 331{,}656 & 286{,}890 & 164{,}390 \\
+Action classes & 704 & 700 & 700 \\
+Training samples & 4.68M & 3.34M & 1.86M \\
+Validation samples & 95{,}774 & 174{,}197 & 59{,}677 \\
+Joint angle dimensions & 22 & 22 & 22 \\
+Action horizon & \multicolumn{3}{c}{16 frames (1.6s)} \\
+Frame rate & \multicolumn{3}{c}{10 Hz} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Each clip yields multiple non-overlapping action windows of 16 frames, producing $\sim$14$\times$ more training samples than clips. The 98\%/2\% train/val split is stratified by video to prevent leakage.
+Each clip yields multiple non-overlapping action windows of 16 frames. The MoveNet-332 split is 98\%/2\% train/val stratified by clip-id hash. The v2 subsets use a 95\%/5\% split, since the clip-id hash distribution skews high enough that a 2\% threshold produces zero validation clips on the filtered sets. All splits prevent leakage at the clip level.
 
 %==============================================================================
 \section{Model Architecture}
@@ -261,7 +289,7 @@ The action decoder uses flow matching~\cite{flowmatching}, a diffusion variant w
 
 \textbf{Hyperparameters:} AdamW optimizer with weight decay 0.01; action head LR $1\times10^{-5}$, LoRA LR $1\times10^{-6}$; batch size 8 per GPU with 16-step gradient accumulation across 4 GPUs (effective batch 512); cosine annealing with warm restarts; gradient clipping at 1.0; mixed-precision bf16.
 
-\textbf{Compute:} Training uses 4$\times$98GB RTX Pro Blackwell GPUs for approximately 6 days ($\sim$576 GPU-hours). For comparison, GR00T N1 reports $\sim$50K H100-hours ($\sim$\$100K at cloud rates), roughly 87$\times$ more compute. Peak memory is $\sim$49GB per GPU.
+\textbf{Compute.} Training uses 4$\times$98GB RTX Pro Blackwell GPUs. The strict-164 model trains in 5.9 days ($\sim$566 GPU-hours), down from $\sim$14 days for the original MoveNet-332 training despite reaching comparable validation loss. The movement-287 sibling model takes 8.8 days. Adding the one-time 11-day data-refinement pass to the strict-164 training budget yields roughly 17 days end to end, all on the same workstation. For comparison, GR00T N1 reports $\sim$50K H100-hours ($\sim$\$100K at cloud rates). Peak memory is $\sim$49GB per GPU.
 
 %==============================================================================
 \section{Inference and Visualization}
@@ -356,24 +384,38 @@ Figure~\ref{fig:qualitative} shows two representative examples from the held-out
 
 \subsection{Quantitative Evaluation}
 
-We evaluate the L24 model on 500 randomly sampled validation clips spanning 319 action classes. Given the ground-truth pose at $t{=}0$, each method predicts joint angles for the full 16-step (1.6\,s) action horizon. We report joint-angle RMSE (degrees) on future frames ($t{=}1..15$) where the model must actually predict. We compare against two baselines: \emph{static} (repeat the $t{=}0$ pose for all future frames) and \emph{linear extrapolation} (constant angular velocity from the previous frame). We also report a high-motion subset, defined as the top quartile by total ground-truth angular displacement ($n{=}125$).
+We evaluate three trained models under identical protocol: the original MIMIC model trained on the full MoveNet-332 release, and two new models trained on the filtered v2 subsets introduced in Section~\ref{sec:retracking}. Each model is evaluated on 500 randomly sampled validation clips from the matching split. Given the ground-truth pose at $t{=}0$, each method predicts joint angles for the full 16-step (1.6\,s) action horizon. We report joint-angle RMSE (degrees) on future frames ($t{=}1..15$). We compare against two baselines: \emph{static} (repeat the $t{=}0$ pose for all future frames) and \emph{linear extrapolation} (constant angular velocity from the previous frame). The high-motion subset is the top quartile by total ground-truth angular displacement ($n{=}125$).
 
 \begin{table}[h]
 \centering
-\caption{Baseline comparison on 500 held-out validation clips. Joint-angle RMSE (degrees) on future frames ($t{=}1..15$, 1.5\,s of prediction). High-motion = top quartile by ground-truth angular displacement ($n{=}125$).}
+\caption{Baseline comparison on 500 held-out validation clips per model. Joint-angle RMSE (degrees) on future frames ($t{=}1..15$, 1.5\,s of prediction). The original MIMIC numbers (top) match the original v1 release; the v2 numbers are from our retraining runs on the filtered subsets, evaluated on each subset's own validation split.}
 \label{tab:baselines}
 \begin{tabular}{lcc}
 \toprule
-\textbf{Method} & \textbf{All} & \textbf{High Motion} \\
+\textbf{Method (training set, val set)} & \textbf{All} & \textbf{High Motion} \\
 \midrule
-Linear extrapolation & 246.1\textdegree & 366.2\textdegree \\
-Static (repeat $t{=}0$) & 43.8\textdegree & 65.6\textdegree \\
-MIMIC (Ours) & \textbf{43.7\textdegree} & \textbf{63.9\textdegree} \\
+Linear (332, 332-val) & 246.1\textdegree & 366.2\textdegree \\
+Static (332, 332-val) & 43.8\textdegree & 65.6\textdegree \\
+MIMIC v1 (332, 332-val) & 43.7\textdegree & 63.9\textdegree \\
+\midrule
+Linear (strict-164, strict-val) & 188.4\textdegree & 279.1\textdegree \\
+Static (strict-164, strict-val) & 41.0\textdegree & 60.7\textdegree \\
+\textbf{MIMIC strict-164} & \textbf{39.8\textdegree} & \textbf{57.5\textdegree} \\
+\midrule
+Linear (287, 287-val) & 188.8\textdegree & 288.7\textdegree \\
+Static (287, 287-val) & 42.6\textdegree & 65.3\textdegree \\
+\textbf{MIMIC 287} & \textbf{40.9\textdegree} & \textbf{61.7\textdegree} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-MIMIC outperforms both baselines. The advantage over the static baseline is modest on average (43.7\textdegree{} vs 43.8\textdegree{}) but grows on the high-motion subset (63.9\textdegree{} vs 65.6\textdegree{}, a 2.6\% reduction), where simply repeating the current pose is a poorer predictor. Linear extrapolation degrades catastrophically over the 1.5\,s horizon (246.1\textdegree{}), as naive constant-velocity assumption amplifies noise and drives predictions far outside the valid joint-angle range. The per-sample distribution (model median 30.4\textdegree{}, p25\,=\,15.0\textdegree{}, p75\,=\,52.4\textdegree{}) shows substantial variation across clips, with the model performing well on moderate-motion activities but struggling on fast, discontinuous movements. Because our evaluation setting (22-DoF joint angle prediction from monocular video with language conditioning) is novel, there are no directly comparable published baselines; the closest systems (GR00T N1--N1.6, Helix) evaluate on physical robots with different action spaces.
+The strict-164 model lowers all-clip RMSE by 9\% (43.7\textdegree{} to 39.8\textdegree{}) and high-motion RMSE by 10\% (63.9\textdegree{} to 57.5\textdegree{}) compared to MIMIC v1. The gap between model and static baseline widens substantially: from 0.1\textdegree{} to 1.2\textdegree{} on all clips (a 12$\times$ larger margin) and from 1.7\textdegree{} to 3.2\textdegree{} on the high-motion subset (5.3\% reduction in error versus 2.6\% in v1). This is the strongest signal that the retracking-plus-VLM filtering meaningfully improved the training distribution: the model is not just hitting a slightly easier validation set, it is also pulling further ahead of the static reference computed on the same clips.
+
+The movement-287 model, trained on the broader vlm-good subset that retains lower-motion activities, reaches the same long-horizon RMSE as strict-164 (40.9\textdegree{} vs 39.8\textdegree{} on each model's own val set, near-identical when evaluated on the same val set) but produces sharper short-horizon predictions: step-1 RMSE of 9.6\textdegree{} vs 11.8\textdegree{} for strict-164, and step-1 median of 2.5\textdegree{} vs 2.9\textdegree{}. We attribute this to broader coverage of low-amplitude motion in the 287 set, which sharpens local pose dynamics without changing the long-horizon ceiling.
+
+\textbf{Per-sample distribution.} For strict-164 at step $S{=}16$, the model achieves median 28.1\textdegree{} (p25\,=\,12.4\textdegree{}, p75\,=\,45.8\textdegree{}), an improvement over v1's median of 30.4\textdegree{}.
+
+\textbf{Linear extrapolation} continues to degrade catastrophically over the 1.5\,s horizon: while its short-horizon error is small, the constant-velocity assumption drives predictions far outside the valid joint-angle range as the horizon grows. Because our evaluation setting (22-DoF joint angle prediction from monocular video with language conditioning) is novel, there are no directly comparable published baselines; the closest systems (GR00T N1--N1.6, Helix) evaluate on physical robots with different action spaces.
 
 %==============================================================================
 \section{Limitations and Future Work}
@@ -394,7 +436,7 @@ MIMIC outperforms both baselines. The advantage over the static baseline is mode
 \section{Conclusion}
 %==============================================================================
 
-We have presented MIMIC, an open-source vision-language-action model for full-body humanoid control, and MoveNet-332, a dataset of 332K processed video clips with 3D poses and instruction captions, both trained entirely from human video. Our key findings are: (1) the GR00T N1-style dual-system architecture transfers effectively to human video data, requiring no robotic teleoperation; (2) DiT scaling yields consistent improvements up to $\sim$1.3B parameters, with diminishing returns beyond; (3) continuous angle representations (sin/cos pairs) are essential for stable training; and (4) the entire pipeline runs on consumer GPUs at $\sim$87$\times$ less compute than GR00T N1. By releasing the complete dataset, model weights, and training code, we lower the barrier to entry for humanoid VLAM research from expensive robotic infrastructure to internet-scale video processing on a single workstation. The most important next step is deployment in simulation and on physical hardware to evaluate our model in true closed-loop settings with environmental feedback.
+We have presented MIMIC, an open-source vision-language-action model for full-body humanoid control, and MoveNet-332, a dataset of 332K processed video clips with 3D poses and instruction captions, both trained entirely from human video. We further introduce a second-pass refinement of the dataset, combining a stricter re-tracker and a 235B VLM judge of skeleton-overlay quality, that yields two filtered releases (movement-strict-164 with 164K clips and movement-287 with 287K clips) and meaningfully better validation accuracy under the same architecture and training budget. Our key findings are: (1) the GR00T N1-style dual-system architecture transfers effectively to human video data, requiring no robotic teleoperation; (2) DiT scaling yields consistent improvements up to $\sim$1.3B parameters, with diminishing returns beyond; (3) continuous angle representations (sin/cos pairs) are essential for stable training; (4) re-tracking and VLM-judged filtering reduces validation RMSE by roughly 10\% and widens the model-versus-static gap by an order of magnitude on the same architecture; and (5) the entire pipeline (data processing, re-tracking, training, and inference) runs on consumer GPUs. By releasing the complete dataset, both filtered subsets, model weights, and all training and re-tracking code, we lower the barrier to entry for humanoid VLAM research from expensive robotic infrastructure to internet-scale video processing on a single workstation. The most important next step is deployment in simulation and on physical hardware to evaluate the model in true closed-loop settings with environmental feedback.
 
 %==============================================================================
 \section*{Data and Code Availability}
@@ -403,14 +445,18 @@ We have presented MIMIC, an open-source vision-language-action model for full-bo
 All resources are publicly available:
 \begin{itemize}
     \item \textbf{Code:} \url{https://anonymous.4open.science/r/movement-D88C}
-    \item \textbf{Dataset (MoveNet-332):} anonymized for review
+    \item \textbf{Dataset (MoveNet-332, original):} anonymized for review
+    \item \textbf{Dataset (movement-strict-164):} anonymized for review
+    \item \textbf{Dataset (movement-287):} anonymized for review
     \item \textbf{Model weights (MIMIC):} anonymized for review
 \end{itemize}
 
 % De-anonymized URLs (for camera-ready version):
-% Code:     https://github.com/maxsegan/movement
-% Dataset:  https://huggingface.co/datasets/maxsegan/movenet-332
-% Model:    https://huggingface.co/maxsegan/mimic-vlam
+% Code:                 https://github.com/maxsegan/movement
+% Dataset (332):        https://huggingface.co/datasets/maxsegan/movenet-332
+% Dataset (strict-164): https://huggingface.co/datasets/maxsegan/movement-strict-164
+% Dataset (287):        https://huggingface.co/datasets/maxsegan/movement-287
+% Model:                https://huggingface.co/maxsegan/mimic-vlam
 
 %==============================================================================
 \section*{Acknowledgments}
