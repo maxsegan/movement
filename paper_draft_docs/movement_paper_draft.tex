@@ -19,14 +19,14 @@
 \title{Bootstrapping Humanoid Foundation Models from Internet-Scale Video}
 
 \author{Max Segan%
-\thanks{Correspondence: \texttt{m.segan@columbia.edu}}}
+\thanks{Columbia University. Correspondence: \texttt{m.segan@columbia.edu}.}}
 
 \begin{document}
 
 \maketitle
 
 \begin{abstract}
-We present an open pipeline that converts internet-scale human video into training data for humanoid robot control. The pipeline combines person detection, tracking, 2D-to-3D pose lifting, re-tracking with a vision-language oracle, and judgment by a 235B vision-language model, and outputs 22-DoF joint angles paired with instruction captions. Applied to Kinetics-700, it yields two released training sets: \textbf{movement-strict-164} (164K clips passing both programmatic and VLM verdicts) and \textbf{movement-287} (287K clips passing the VLM verdict alone). We train MIMIC, a 4.0B-parameter vision-language-action model with a diffusion-transformer action head, on movement-strict-164. MIMIC reaches 39.8\textdegree{} joint-angle RMSE over 1.5\,s of prediction, beating static and linear baselines, and widens the model-versus-static gap by an order of magnitude over an ablation trained on the unfiltered intermediate corpus. A sibling model trained on movement-287 matches long-horizon RMSE with sharper short-horizon predictions. Performance is bimodal across activity type: cyclical motions (pull-ups, squats, jumping rope) predict much more accurately than multi-step compositional sequences, pointing to data coverage rather than model capacity as the binding constraint. The full system (pipeline, re-tracking, VLM judging, training, inference) runs on consumer GPUs. Code, both datasets, and model weights are publicly released.
+We present an open pipeline that converts internet-scale human video into training data for humanoid robot control. The pipeline combines person detection, tracking, 2D-to-3D pose lifting, re-tracking with a vision-language oracle, and judgment by a 235B vision-language model, and outputs 22-DoF joint angles paired with instruction captions. Applied to Kinetics-700, it yields two released training sets: \textbf{movement-strict-164} (164K clips passing both programmatic and VLM verdicts) and \textbf{movement-287} (287K clips passing the VLM verdict alone). We train MIMIC (Motion Imitation from Massive Internet Clips), a 4.0B-parameter vision-language-action model with a diffusion-transformer action head, on movement-strict-164. MIMIC reaches 39.8\textdegree{} joint-angle RMSE over a 1.6\,s prediction horizon, beating static and linear baselines, and widens the model-versus-static gap by an order of magnitude over an ablation trained on the unfiltered intermediate corpus. A sibling model trained on movement-287 matches long-horizon RMSE with sharper short-horizon predictions. Performance is bimodal across activity type: cyclical motions (pull-ups, squats, jumping rope) predict much more accurately than multi-step compositional sequences, pointing to data coverage rather than model capacity as the binding constraint. The full system (pipeline, re-tracking, VLM judging, training, inference) runs on consumer GPUs. Code, both datasets, and model weights are publicly released.
 \end{abstract}
 
 %==============================================================================
@@ -46,23 +46,23 @@ Vision-language-action models (VLAMs) condition motor commands on a camera image
 
 \begin{table*}[t]
 \centering
-\caption{Comparison of vision-language-action models. MIMIC is the only humanoid VLAM that is fully open-source, trains from freely available internet video, and runs on consumer hardware.}
+\caption{Comparison of vision-language-action models. MIMIC is the only humanoid VLAM that is fully open-source, trains from freely available internet video, and runs on consumer hardware. Open Source column: W = weights, C = code, D = data. Training-compute figures are reported as published by each work; GPU-hours are \emph{not} directly comparable across hardware generations (A100, H100, RTX Pro Blackwell differ in throughput by 2--4$\times$).}
 \label{tab:vlam_compare}
 \resizebox{\textwidth}{!}{%
-\begin{tabular}{lccccccc}
+\begin{tabular}{lcccccll}
 \toprule
 \textbf{Model} & \textbf{Params} & \textbf{Embodiment} & \textbf{DoF} & \textbf{Closed-Loop} & \textbf{Open Source} & \textbf{Data Source} & \textbf{Training Compute} \\
 \midrule
-RT-2~\cite{rt2} & 55B & Arm & 7 & \checkmark & \texttimes & Robot teleop & Datacenter \\
-Octo~\cite{octo} & 93M & Arm & 7 & \checkmark & Weights+Code & Robot teleop & 8$\times$A100 \\
-OpenVLA~\cite{openvla} & 7B & Arm & 7 & \checkmark & Weights+Code & Robot teleop & 16$\times$A100 \\
-$\pi_0$~\cite{pi0} & 3B & Arm & 7+ & \checkmark & \texttimes & Robot teleop & Datacenter \\
-UH-1~\cite{uh1} & N/R & Humanoid & 52 & \texttimes & Scripts only & Human video & N/R \\
-GR00T N1~\cite{groot} & 2.2B & Humanoid & 52 & \checkmark & Weights only & Teleop + MoCap & $\sim$50K H100-hrs \\
-GR00T N1.5~\cite{groot_n15} & 3.0B & Humanoid & 52 & \checkmark & Weights only & Teleop + human video & 1K H100s \\
-Helix~\cite{helix} & $\sim$7B & Humanoid & 35 & \checkmark & \texttimes & 500h teleop & Datacenter \\
+RT-2~\cite{rt2} & 55B & Arm & 7 & \checkmark & \texttimes & Robot teleop & Not reported \\
+Octo~\cite{octo} & 93M & Arm & 7 & \checkmark & W+C & Robot teleop & $\sim$8K A100-hours \\
+OpenVLA~\cite{openvla} & 7B & Arm & 7 & \checkmark & W+C & Robot teleop & $\sim$21.5K A100-hours \\
+$\pi_0$~\cite{pi0} & 3B & Arm & 7+ & \checkmark & \texttimes & Robot teleop & Not reported \\
+UH-1~\cite{uh1} & N/R & Humanoid & 52 & \texttimes & Scripts only & Human video & Not reported \\
+GR00T N1~\cite{groot} & 2.2B & Humanoid & 52 & \checkmark & Weights only & Teleop + MoCap & $\sim$50K H100-hours \\
+GR00T N1.5~\cite{groot_n15} & 3.0B & Humanoid & 52 & \checkmark & Weights only & Teleop + human video & Not reported (1K H100s) \\
+Helix~\cite{helix} & $\sim$7B & Humanoid & 35 & \checkmark & \texttimes & 500h teleop & Not reported \\
 \midrule
-\textbf{MIMIC (Ours)} & 4.0B & Humanoid & 22 & \checkmark & All (W+C+D) & Internet video & 4$\times$RTX ($\sim$576 hrs) \\
+\textbf{MIMIC (Ours)} & 4.0B & Humanoid & 22 & \checkmark & W+C+D & Internet video & $\sim$550 RTX Pro Blackwell-hours \\
 \bottomrule
 \end{tabular}%
 }
@@ -88,7 +88,7 @@ Several works learn robot control from human demonstrations: R3M~\cite{r3m} (vis
 
 \subsection{Humanoid VLAMs}
 
-GR00T N1~\cite{groot} pairs an Eagle-2 VLM with a 16-layer DiT flow matching head (2.2B parameters total), trained on teleoperation, motion capture, and synthetic data ($\sim$50K H100-hours). NVIDIA released open weights and fine-tuning code under a non-commercial license, though pretraining data remains proprietary. GR00T N1.5~\cite{groot_n15} (3.0B) replaces Eagle-2 with an improved VLM and introduces a FLARE loss that aligns future latent representations, enabling learning from human video alongside teleoperation data. GR00T N1.6~\cite{groot_n16} (3.3B) doubles DiT capacity to 32 layers and switches to state-relative action prediction for smoother trajectories. Our architecture follows N1's dual-system design but trains entirely from internet video and requires $\sim$87$\times$ less compute.
+GR00T N1~\cite{groot} pairs an Eagle-2 VLM with a 16-layer DiT flow matching head (2.2B parameters total), trained on teleoperation, motion capture, and synthetic data ($\sim$50K H100-hours). NVIDIA released open weights and fine-tuning code under a non-commercial license, though pretraining data remains proprietary. GR00T N1.5~\cite{groot_n15} (3.0B) replaces Eagle-2 with an improved VLM and introduces a FLARE loss that aligns future latent representations, enabling learning from human video alongside teleoperation data. GR00T N1.6~\cite{groot_n16} (3.3B) doubles DiT capacity to 32 layers and switches to state-relative action prediction for smoother trajectories. Our architecture follows N1's dual-system design but trains entirely from internet video and runs end-to-end on a single 4-GPU workstation rather than at datacenter scale (see Section~\ref{sec:training_compute} for a quantitative comparison and its caveats).
 
 Helix~\cite{helix} uses a 7B VLM at $\sim$8Hz conditioning an 80M visuomotor policy at 200Hz, trained on $\sim$500 hours of teleoperation. Neither release includes weights, code, or data. All of these systems rely on proprietary teleoperation data, simulation, or motion capture; our work trains from freely available internet video alone.
 
@@ -117,7 +117,7 @@ Videos contain multiple people, camera cuts, and scene transitions; stage 1 must
 
 \subsection{Pose Estimation}
 
-We use ViTPose-Large~\cite{vitpose} for 2D pose estimation on crops with 10\% padding (17 COCO keypoints per frame), and MotionAGFormer~\cite{motionagformer} for 2D-to-3D lifting, processing 243-frame windows for temporal smoothing. Raw 3D poses are normalized to a canonical frame (pelvis at origin, facing $+Z$, unit body scale) and converted to 22 joint angles for training (Section~\ref{sec:action_rep}). We validate against 200 NTU RGB+D 120~\cite{ntu120} clips, converting both our predictions and the Kinect ground truth to our 22-DoF representation; the pipeline reaches 74.6\textdegree{} joint-angle RMSE (median 74.6\textdegree{}, std 7.3\textdegree{}) with zero failures. The residual reflects compounding factors (NTU's 25-joint Kinect skeleton maps only approximately to H3.6M's 17 joints, Kinect has 20--50mm depth noise, and MoCap markers capture different body geometry than depth-fitted skeletons) rather than systematic pipeline error.
+We use ViTPose-Large~\cite{vitpose} for 2D pose estimation on crops with 10\% padding (17 COCO keypoints per frame), and MotionAGFormer~\cite{motionagformer} for 2D-to-3D lifting, processing 243-frame windows for temporal smoothing. Raw 3D poses are normalized to a canonical frame (pelvis at origin, facing $+Z$, unit body scale) and converted to 22 joint angles for training (Section~\ref{sec:action_rep}). We validate against 200 NTU RGB+D 120~\cite{ntu120} clips, converting both our predictions and the Kinect ground truth to our 22-DoF representation; the two systems disagree by 74.6\textdegree{} joint-angle RMSE (median 74.6\textdegree{}, std 7.3\textdegree{}) with zero pipeline failures. This number is not a noise floor for our task. It is a cross-system disagreement dominated by joint-mapping mismatch (NTU's 25-joint Kinect skeleton maps only approximately to H3.6M's 17 joints) and by Kinect's own body-fitting error and 20--50\,mm depth noise. We use NTU only to confirm that our pipeline produces plausible joint angles on in-distribution actions, not as a literal lower bound on achievable error.
 
 \subsection{Quality Filtering}
 \label{sec:filtering}
@@ -247,6 +247,7 @@ The action decoder uses flow matching~\cite{flowmatching}, a diffusion variant w
 \textbf{Absolute angle prediction.} The model directly predicts absolute joint angles for each timestep rather than residuals from the current pose (see ablation in Section~\ref{sec:ablations}).
 
 \subsection{Training}
+\label{sec:training_compute}
 
 \textbf{Loss:} Flow matching velocity prediction: $\mathcal{L} = \|v_\theta(x_t, t) - (a - \epsilon)\|^2$ where $x_t = t \cdot a + (1-t) \cdot \epsilon$ is the noisy interpolation, $a$ the target actions, $\epsilon \sim \mathcal{N}(0, I)$ noise, and $t \sim \text{Beta}(1.5, 1)$.
 
@@ -254,7 +255,7 @@ The action decoder uses flow matching~\cite{flowmatching}, a diffusion variant w
 
 \textbf{Hyperparameters:} AdamW optimizer with weight decay 0.01; action head LR $1\times10^{-5}$, LoRA LR $1\times10^{-6}$; batch size 8 per GPU with 16-step gradient accumulation across 4 GPUs (effective batch 512); cosine annealing with warm restarts; gradient clipping at 1.0; mixed-precision bf16.
 
-\textbf{Compute.} Training uses 4$\times$98GB RTX Pro Blackwell GPUs. MIMIC trains in 5.9 days ($\sim$566 GPU-hours); the 287 model takes 8.8 days. Stage 2 of the data pipeline runs once on the same hardware: 4.9 days to judge all 325K clips at 33 clips/min, 3.4 days to re-track the 217K disagreement clips at 44 clips/min, and 2.9 days to re-judge them, totalling $\sim$11 days end to end with zero VLM errors over 519K judgment calls. Going from raw Kinetics-700 to a trained MIMIC fits in under 17 wall-clock days on a single workstation. For comparison, GR00T N1 reports $\sim$50K H100-hours for training alone. Peak memory is $\sim$49GB per GPU.
+\textbf{Compute.} Training uses 4$\times$98GB RTX Pro Blackwell GPUs. MIMIC trains in 5.9 days ($\sim$550 GPU-hours); the 287 model takes 8.8 days. Stage 2 of the data pipeline runs once on the same hardware: 4.9 days to judge all 325K clips at 33 clips/min, 3.4 days to re-track the 217K disagreement clips at 44 clips/min, and 2.9 days to re-judge them, totalling $\sim$11 days end to end. Going from raw Kinetics-700 to a trained MIMIC fits in under 17 wall-clock days on a single workstation. For comparison, GR00T N1 reports $\sim$50K H100-hours for training alone, on different data and a different target distribution; the comparison illustrates an order-of-magnitude difference in resource requirements rather than a like-for-like efficiency gain. Peak memory is $\sim$49GB per GPU.
 
 %==============================================================================
 \section{Inference and Visualization}
@@ -290,7 +291,7 @@ We report:
 \begin{itemize}
     \item \textbf{Joint Angle RMSE:} Root mean squared error in radians between predicted and ground-truth joint angles
     \item \textbf{Position MPJPE:} Mean per-joint position error after converting angles to 3D positions (mm)
-    \item \textbf{Pipeline Angle RMSE:} Joint angle RMSE between pipeline-extracted and motion-capture ground truth (74.6\textdegree{} on NTU RGB+D 120), representing the training data noise floor
+    \item \textbf{Pipeline Angle RMSE:} Cross-system joint-angle RMSE between our pipeline and Kinect-derived ground truth (74.6\textdegree{} on NTU RGB+D 120). This figure reflects joint-mapping mismatch and Kinect body-fit error in addition to any pipeline noise, and is not a noise-floor estimate
 \end{itemize}
 
 %==============================================================================
@@ -354,7 +355,7 @@ We evaluate three trained models under identical protocol: a 325K-clip ablation 
 
 \begin{table}[h]
 \centering
-\caption{Baseline comparison on 500 held-out validation clips per model. Joint-angle RMSE (degrees) on future frames ($t{=}1..15$, 1.5\,s). Each model is evaluated on its training set's own held-out split.}
+\caption{Baseline comparison on 500 held-out validation clips per model. Joint-angle RMSE (degrees) on future frames ($t{=}1..15$ of the 1.6\,s horizon). Each model is evaluated on its training set's own held-out split.}
 \label{tab:baselines}
 \begin{tabular}{lcc}
 \toprule
@@ -378,7 +379,7 @@ Static baseline & 42.6\textdegree & 65.3\textdegree \\
 \end{tabular}
 \end{table}
 
-MIMIC lowers all-clip RMSE by 9\% and high-motion RMSE by 10\% over the 325K ablation. The gap to the static baseline widens substantially: from 0.1\textdegree{} to 1.2\textdegree{} on all clips (a 12$\times$ larger margin) and from 1.7\textdegree{} to 3.2\textdegree{} on the high-motion subset (5.3\% relative reduction vs 2.6\% in the ablation). This is the strongest signal that re-tracking and VLM filtering meaningfully improved the training distribution: MIMIC is not merely hitting an easier validation set, it is also pulling further ahead of the static reference computed on the same clips. Linear extrapolation continues to degrade catastrophically over the 1.5\,s horizon as the constant-velocity assumption drives predictions outside the valid joint range.
+MIMIC lowers all-clip RMSE by 9\% and high-motion RMSE by 10\% over the 325K ablation. The gap to the static baseline widens substantially: from 0.1\textdegree{} to 1.2\textdegree{} on all clips (a 12$\times$ larger margin) and from 1.7\textdegree{} to 3.2\textdegree{} on the high-motion subset (5.3\% relative reduction vs 2.6\% in the ablation). This is the strongest signal that re-tracking and VLM filtering meaningfully improved the training distribution: MIMIC is not merely hitting an easier validation set, it is also pulling further ahead of the static reference computed on the same clips. Linear extrapolation continues to degrade catastrophically over the 1.6\,s horizon as the constant-velocity assumption drives predictions outside the valid joint range.
 
 The 287 model matches MIMIC's long-horizon RMSE but produces sharper short-horizon predictions (step-1 median 2.5\textdegree{} vs 2.9\textdegree{}; step-1 RMSE 9.6\textdegree{} vs 11.8\textdegree{}). We attribute this to the broader coverage of low-amplitude motion in the 287 set, which sharpens local pose dynamics without changing the long-horizon ceiling.
 
@@ -421,7 +422,7 @@ All resources are publicly available:
 \section*{Acknowledgments}
 %==============================================================================
 
-This work was supported in part by Hod Lipson and the U.S. National Science Foundation AI Institute for Dynamical Systems, grant \#2112085. We thank the authors of YOLOv8, ByteTrack, ViTPose, MotionAGFormer, and Qwen3-VL for releasing pretrained models and code, the Kinetics-700 team for the dataset, and Anthropic for Claude Code, which was used to build, run, and tune the data pipeline and training infrastructure for this work.
+This work was supported in part by Hod Lipson (Columbia University) and the U.S. National Science Foundation AI Institute for Dynamical Systems, grant \#2112085. We thank the authors of YOLOv8, ByteTrack, ViTPose, MotionAGFormer, and Qwen3-VL for releasing pretrained models and code, the Kinetics-700 team for the dataset, and Anthropic for Claude Code, which was used to build, run, and tune the data pipeline and training infrastructure for this work.
 
 %==============================================================================
 \bibliographystyle{plain}
