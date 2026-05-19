@@ -18,7 +18,8 @@
 
 \title{Bootstrapping Humanoid Foundation Models from Internet-Scale Video}
 
-\author{Anonymous}
+\author{Max Segan%
+\thanks{Correspondence: \texttt{max@segan.com}}}
 
 \begin{document}
 
@@ -32,13 +33,9 @@ We present an open pipeline that converts internet-scale human video into traini
 \section{Introduction}
 %==============================================================================
 
-Vision-language-action models (VLAMs) have emerged as a promising paradigm for robot learning: given a camera image and a natural language instruction (e.g., ``raise both arms overhead''), a VLAM directly outputs the motor commands needed to execute that instruction, unifying perception, language understanding, and motor control in a single model. Recent systems such as RT-2~\cite{rt2}, OpenVLA~\cite{openvla}, $\pi_0$~\cite{pi0}, and GR00T N1~\cite{groot} have demonstrated impressive generalization capabilities, particularly for robotic manipulation tasks.
+Vision-language-action models (VLAMs) condition motor commands on a camera image and a language instruction, unifying perception, language, and control. Recent systems (RT-2~\cite{rt2}, OpenVLA~\cite{openvla}, $\pi_0$~\cite{pi0}, GR00T N1~\cite{groot}) have shown strong generalization on robotic manipulation. Extending VLAMs to \emph{full-body humanoid control} is harder: humanoids have many more degrees of freedom than manipulators (17+ vs.\ 6--7), require whole-body coordination, and must handle dynamic balance. Open-loop systems like MotionGPT~\cite{motiongpt} and UH-1~\cite{uh1} produce motion from text without visual feedback and cannot correct for drift. Closed-loop humanoid VLAMs do exist, but Helix~\cite{helix} and GR00T N1--N1.6~\cite{groot,groot_n15,groot_n16} all rely on proprietary robotic teleoperation data and, in Helix's case, closed-source models. Without humanoid hardware or teleoperation infrastructure, researchers cannot reproduce or extend these systems.
 
-However, extending VLAMs to \emph{full-body humanoid control} presents unique challenges. Humanoids have significantly more degrees of freedom than typical manipulators (17+ joints vs.\ 6--7), require whole-body coordination, and must handle dynamic balance, making the action space both higher-dimensional and more tightly constrained. Prior work on full-body control from language, such as MotionGPT~\cite{motiongpt} and UH-1~\cite{uh1}, operates in \emph{open-loop}: given a text instruction, these models produce motion sequences without visual feedback, and cannot react to environmental changes or correct for drift.
-
-The recent Helix~\cite{helix} and GR00T N1--N1.6~\cite{groot,groot_n15,groot_n16} systems demonstrate closed-loop humanoid VLAMs, but all rely on proprietary robotic teleoperation data and, in Helix's case, closed-source models. This creates a barrier for research: without access to humanoid robots and teleoperation infrastructure, researchers cannot reproduce or build upon these systems.
-
-\textbf{Our approach.} We address this by training a closed-loop humanoid VLAM entirely from \emph{human video data}. Internet-scale human video contains rich demonstrations of full-body motion that, when properly processed, can serve as training data for humanoid imitation learning. Our contributions are:
+\textbf{Our approach.} We train a closed-loop humanoid VLAM entirely from \emph{human video data}, which contains rich demonstrations of full-body motion. Our contributions are:
 
 \begin{enumerate}
     \item \textbf{Open Pipeline:} An end-to-end pose extraction and curation pipeline (detection, tracking, 2D$\to$3D lifting, programmatic continuity filters, re-tracking with a vision-language oracle, judgment by a 235B vision-language model, VLM captioning) that converts raw internet video into training-ready data, applicable to any video source.
@@ -79,17 +76,15 @@ Helix~\cite{helix} & $\sim$7B & Humanoid & 35 & \checkmark & \texttimes & 500h t
 
 VLAMs extend vision-language models (VLMs) to output robot actions conditioned on visual observations and language instructions. RT-2~\cite{rt2} first demonstrated this paradigm by fine-tuning a VLM to output discretized actions. Subsequent work has explored various architectural choices: OpenVLA~\cite{openvla} provides an open-source 7B-parameter alternative; $\pi_0$~\cite{pi0} introduces flow matching for continuous action generation; and Octo~\cite{octo} and TinyVLA~\cite{tinyvla} explore efficient architectures for resource-constrained deployment.
 
-\textbf{Recent developments:} The field has advanced rapidly. Physical Intelligence released $\pi_{0.5}$~\cite{pi05} with co-training on heterogeneous tasks and $\pi_0$-FAST~\cite{pi0fast} with frequency-space action tokenization. Google DeepMind introduced Gemini Robotics 1.5~\cite{gemini15} with a Motion Transfer mechanism for multi-embodiment learning. SmolVLA~\cite{smolvla} provides a compact 450M-parameter open-source alternative using flow matching. OpenVLA-OFT~\cite{openvla_oft} integrates action chunking, boosting success from 76.5\% to 97.1\% on LIBERO. A2A~\cite{a2a} achieves single-step inference (0.56ms) by initializing from prior actions.
+Recent extensions include $\pi_{0.5}$~\cite{pi05} (heterogeneous co-training), $\pi_0$-FAST~\cite{pi0fast} (frequency-space action tokens), Gemini Robotics 1.5~\cite{gemini15} (multi-embodiment Motion Transfer), SmolVLA~\cite{smolvla} (450M parameters with flow matching), OpenVLA-OFT~\cite{openvla_oft} (action chunking), and A2A~\cite{a2a} (single-step inference).
 
 \subsection{Full-Body Motion from Language}
 
-A parallel line of work generates full-body human motion from text descriptions. MotionDiffuse~\cite{motiondiffuse} and MotionGPT~\cite{motiongpt} use diffusion and GPT-style architectures, respectively, to generate motion sequences. However, these approaches are \emph{open-loop}: they do not condition on visual observations and cannot adapt to environmental feedback.
-
-UH-1~\cite{uh1} is most similar to our approach: it processes Kinetics videos to create the Humanoid-X dataset of 20M poses with text descriptions. However, UH-1 only provides scripts to \emph{recreate} the dataset (not the dataset itself), uses simpler pixel-wise motion detection (vs.\ our pose-based filtering), operates in open-loop, and does not release model weights.
+A parallel line of work generates full-body human motion from text. MotionDiffuse~\cite{motiondiffuse} and MotionGPT~\cite{motiongpt} use diffusion and GPT-style architectures respectively, but are open-loop and do not condition on visual observations. UH-1~\cite{uh1} is closest to our setup: it processes Kinetics to create the Humanoid-X dataset of 20M poses with text descriptions, but only provides scripts to recreate the dataset (not the dataset itself), uses pixel-wise motion detection rather than pose-based filtering, operates open-loop, and does not release weights.
 
 \subsection{Learning from Human Video}
 
-Several works explore learning robot control from human demonstrations. R3M~\cite{r3m} learns visual representations from human video. EgoVLA~\cite{egovla} pretrains on egocentric human manipulation data and uses inverse kinematics to retarget to robots. mimic-video~\cite{mimicvideo} pairs internet-scale video models with flow matching action decoders, achieving 10$\times$ better sample efficiency than standard VLAs. WholeBodyVLA~\cite{wholebodyvla} learns latent actions from action-free egocentric videos through a Latent Action Model. SONIC~\cite{sonic} scales motion tracking to 42M parameters on 700 hours of data to produce natural humanoid control. Our work differs by directly extracting 3D pose from third-person video, requiring no egocentric data, paired demonstrations, or simulation.
+Several works learn robot control from human demonstrations: R3M~\cite{r3m} (visual representations from human video), EgoVLA~\cite{egovla} (egocentric manipulation pretraining with IK retargeting), mimic-video~\cite{mimicvideo} (internet-video models with flow-matching decoders), WholeBodyVLA~\cite{wholebodyvla} (latent actions from action-free egocentric video), and SONIC~\cite{sonic} (motion tracking scaled to 700 hours). Our work differs by extracting 3D pose directly from third-person video, requiring no egocentric data, paired demonstrations, or simulation.
 
 \subsection{Humanoid VLAMs}
 
@@ -105,9 +100,9 @@ Our dataset pipeline processes raw Kinetics-700 videos through two stages. The f
 
 \subsection{Data Source Selection}
 
-We selected Kinetics-700 as our primary data source for several reasons: (1) large scale (650K+ videos across 700 action classes); (2) diversity of human activities; (3) ``in-the-wild'' recording conditions that improve model robustness; and (4) it provides prefiltering to save compute time by limiting to videos of human action compared to general internet video.
+We selected Kinetics-700 for scale (650K+ videos across 700 action classes), diversity, in-the-wild recording, and built-in human-action prefiltering (saving compute relative to general internet video).
 
-\textbf{NTU RGB+D 120 for Validation.} While Kinetics provides scale and diversity, it lacks ground-truth 3D pose annotations. We use NTU RGB+D 120~\cite{ntu120} to validate our pose extraction pipeline. NTU RGB+D 120 contains 114K video clips with synchronized RGB, depth, and skeleton annotations captured via Kinect sensors across 120 action classes. However, NTU's controlled lab environment (uniform backgrounds, fixed camera positions) makes it poorly suited as training data. We therefore use NTU exclusively for \emph{validating} our pose extraction pipeline's accuracy before applying it to Kinetics.
+Kinetics lacks 3D pose ground truth, so for pipeline validation we use NTU RGB+D 120~\cite{ntu120} (114K clips with synchronized RGB, depth, and Kinect skeleton across 120 classes). Its controlled lab conditions make it unsuitable as training data, so we use it only for accuracy validation.
 
 \subsection{Person Detection and Tracking}
 
@@ -416,23 +411,17 @@ We presented MIMIC, an open-source vision-language-action model for full-body hu
 
 All resources are publicly available:
 \begin{itemize}
-    \item \textbf{Code:} \url{https://anonymous.4open.science/r/movement-D88C}
-    \item \textbf{Dataset (movement-strict-164):} anonymized for review
-    \item \textbf{Dataset (movement-287):} anonymized for review
-    \item \textbf{Model weights (MIMIC):} anonymized for review
+    \item \textbf{Code:} \url{https://github.com/maxsegan/movement}
+    \item \textbf{Dataset (movement-strict-164):} \url{https://huggingface.co/datasets/maxsegan/movement-strict-164}
+    \item \textbf{Dataset (movement-287):} \url{https://huggingface.co/datasets/maxsegan/movement-287}
+    \item \textbf{Model weights (MIMIC):} \url{https://huggingface.co/maxsegan/mimic-vlam}
 \end{itemize}
-
-% De-anonymized URLs (for camera-ready version):
-% Code:                 https://github.com/maxsegan/movement
-% Dataset (strict-164): https://huggingface.co/datasets/maxsegan/movement-strict-164
-% Dataset (287):        https://huggingface.co/datasets/maxsegan/movement-287
-% Model:                https://huggingface.co/maxsegan/mimic-vlam
 
 %==============================================================================
 \section*{Acknowledgments}
 %==============================================================================
 
-This work was supported in part by the U.S. National Science Foundation AI Institute for Dynamical Systems, grant \#2112085 to [redacted for review]. We acknowledge the Kinetics-700 dataset, and the authors of ViTPose, MotionAGFormer, and Qwen3-VL for releasing pretrained models and code, and Anthropic for Claude Code, which was used in this work.
+We thank the authors of YOLOv8, ByteTrack, ViTPose, MotionAGFormer, and Qwen3-VL for releasing pretrained models and code, the Kinetics-700 team for making the dataset available, and Anthropic for Claude Code, which was used to build, run, and tune the data pipeline and training infrastructure for this work.
 
 %==============================================================================
 \bibliographystyle{plain}
